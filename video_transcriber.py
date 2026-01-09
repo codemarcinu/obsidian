@@ -1,249 +1,152 @@
 import os
-import re
-import shutil
-import subprocess
-import time
-import logging
-from datetime import timedelta
-import requests
-import yt_dlp
 import torch
+import logging
+import yt_dlp
+import warnings
+from typing import List, Dict, Optional, Any
 from faster_whisper import WhisperModel
+from pyannote.audio import Pipeline
 from config import ProjectConfig
 
-# Optional PyAnnote import
-try:
-    from pyannote.audio import Pipeline
-    PYANNOTE_AVAILABLE = True
-except ImportError:
-    PYANNOTE_AVAILABLE = False
-
-logger = logging.getLogger("VideoTranscriber")
+# Wyciszenie specyficznych warningów
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 class VideoTranscriber:
-    def __init__(self, log_callback=None, progress_callback=None):
-        self.log = log_callback if log_callback else self._default_log
-        self.progress = progress_callback if progress_callback else self._default_progress
-        self.stop_event_set = False
-        
+    def __init__(self, model_size: str = "medium", log_callback=None, progress_callback=None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
+        self.logger = logging.getLogger("VideoTranscriber")
+        self.log_callback = log_callback
+        self.progress_callback = progress_callback
         
-        logger.info(f"VideoTranscriber initialized on {self.device} ({self.compute_type})")
+        self.logger.info(f"VideoTranscriber initialized on {self.device} ({self.compute_type})")
 
-    def _default_log(self, message):
-        logger.info(message)
-
-    def _default_progress(self, percent, stage, details=None):
-        pass
-
-    def stop(self):
-        self.stop_event_set = True
-
-    def validate_url(self, url):
-        if not url or not url.strip():
-            return False
-        youtube_regex = (
-            r"(https?://)?(www\.)?"
-            r"(youtube|youtu|youtube-nocookie)\.(com|be)/"
-            r"(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})"
-        )
-        return re.match(youtube_regex, url.strip())
-
-    def download_video(self, url, save_path=None, quality="best"):
-        if self.stop_event_set: raise InterruptedError("Cancelled")
+    def download_video(self, url: str, save_path: str = None) -> str:
+        """
+        Downloads video/audio from YouTube using yt-dlp with SAFE filenames.
+        """
+        output_dir = save_path if save_path else str(ProjectConfig.TEMP_DIR)
         
-        # Use TEMP_DIR from config if save_path not provided
-        target_dir = save_path if save_path else str(ProjectConfig.TEMP_DIR)
-        
-        self.log(f"Downloading video from: {url} to {target_dir}")
-        self.progress(0, "downloading")
+        # Używamy ID wideo jako nazwy pliku, aby uniknąć problemów ze znakami specjalnymi w tytułach
+        # %(id)s.%(ext)s gwarantuje unikalność i brak spacji.
+        out_template = os.path.join(output_dir, '%(id)s.%(ext)s')
 
         ydl_opts = {
-            "outtmpl": os.path.join(target_dir, "% (title)s.%(ext)s"),
-            "progress_hooks": [self._yt_dlp_hook],
-            "writethumbnail": False,
-            "writeinfojson": False,
-            "keepvideo": False,
-            "noplaylist": True,
-            "format": "bestaudio/best", # Prefer audio for transcription efficiency
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                },
-            ],
+            'format': 'bestaudio/best',
+            'outtmpl': out_template,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'quiet': True,
+            'no_warnings': True,
+            'restrictfilenames': True, # Dodatkowe zabezpieczenie nazwy
         }
 
-        filename = ""
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                # yt-dlp with postprocessor changes ext to mp3
-                filename = os.path.splitext(filename)[0] + ".mp3"
+                if self.log_callback: self.log_callback("Pobieranie metadanych...")
+                info_dict = ydl.extract_info(url, download=True)
                 
+                # Pobierz rzeczywistą nazwę pliku po post-processingu (zamiana na mp3)
+                video_id = info_dict.get('id', 'video')
+                # yt-dlp z automatu zmienia rozszerzenie na mp3 po konwersji
+                final_filename = f"{video_id}.mp3"
+                final_path = os.path.join(output_dir, final_filename)
+                
+                self.logger.info(f"Downloaded audio to: {final_path}")
+                
+                # Zwracamy też tytuł, może się przydać w metadanych (opcjonalnie można go zwrócić jako tuple)
+                # Na potrzeby interfejsu zwracamy ścieżkę.
+                return final_path
+
         except Exception as e:
-            raise Exception(f"Download failed: {str(e)}")
+            self.logger.error(f"Download failed: {e}")
+            raise e
 
-        self.progress(100, "downloading")
-        return filename
-
-    def _yt_dlp_hook(self, d):
-        if self.stop_event_set: raise InterruptedError("Cancelled")
-        if d["status"] == "downloading":
-            try:
-                p = d.get("_percent_str", "0%").replace("%", "")
-                self.progress(float(p), "downloading")
-            except: pass
-
-    def transcribe_and_diarize(self, audio_path, language="pl", model_size="medium", use_diarization=True):
-        if self.stop_event_set: raise InterruptedError("Cancelled")
-
-        # 1. Transcription (Whisper)
-        self.log(f"Starting Whisper transcription ({model_size})...")
-        segments = self._run_whisper(audio_path, language, model_size)
-
-        # 2. Diarization (PyAnnote) - Optional
-        speakers = {}
-        if use_diarization and PYANNOTE_AVAILABLE:
-            if ProjectConfig.HF_TOKEN:
-                self.log("Starting Speaker Diarization (PyAnnote)...")
-                speakers = self._run_diarization(audio_path)
-            else:
-                self.log("Skipping Diarization: HF_TOKEN not set in Config (.env).")
-        elif use_diarization and not PYANNOTE_AVAILABLE:
-            self.log("Skipping Diarization: pyannote.audio not installed.")
-
-        # 3. Merge
-        final_transcript = self._merge_transcript_speakers(segments, speakers)
-        return final_transcript
-
-    def _run_whisper(self, audio_path, language, model_size):
-        self.progress(0, "transcribing")
+    def transcribe_and_diarize(self, audio_path: str, language: str = "pl", 
+                             model_size: str = "medium", use_diarization: bool = True) -> List[Dict[str, Any]]:
+        """
+        Runs Whisper for transcription and Pyannote for speaker diarization.
+        """
+        if self.progress_callback: self.progress_callback(10, "Ładowanie modelu Whisper...")
+        
         try:
-            # Load model (cache in Project defined cache or default)
+            # 1. Transcribe
             model = WhisperModel(model_size, device=self.device, compute_type=self.compute_type)
+            segments, info = model.transcribe(audio_path, language=language, vad_filter=True)
             
-            segments_generator, info = model.transcribe(
-                audio_path,
-                language=language if language != "auto" else None,
-                beam_size=5,
-                vad_filter=True
-            )
+            transcript_segments = []
+            if self.progress_callback: self.progress_callback(30, "Transkrypcja w toku...")
             
-            segments = []
-            for segment in segments_generator:
-                if self.stop_event_set: raise InterruptedError("Cancelled")
-                segments.append({
+            # Konwersja generatora na listę, aby móc wielokrotnie iterować
+            for segment in segments:
+                transcript_segments.append({
                     "start": segment.start,
                     "end": segment.end,
                     "text": segment.text.strip()
                 })
-                # Simple progress update (fake, as we don't know exact duration easily inside loop without pre-check)
-                self.progress(50, "transcribing", details=f"{segment.end:.1f}s processed")
-            
-            self.progress(100, "transcribing")
-            return segments
-            
-        except Exception as e:
-            logger.error(f"Whisper Error: {e}")
-            raise
 
-    def _run_diarization(self, audio_path):
-        self.progress(0, "diarizing")
-        try:
+            if not use_diarization:
+                return transcript_segments
+
+            # 2. Diarization (Optional but recommended)
+            # Uwaga: Pyannote wymaga tokena HF. Jeśli go nie ma, pomijamy diaryzację z warningiem.
+            hf_token = os.getenv("HF_TOKEN")
+            if not hf_token:
+                self.logger.warning("Brak HF_TOKEN. Pomijam diaryzację.")
+                return transcript_segments
+
+            if self.progress_callback: self.progress_callback(60, "Diaryzacja (rozpoznawanie mówców)...")
+            
             pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                use_auth_token=ProjectConfig.HF_TOKEN
-            )
-            pipeline.to(torch.device(self.device))
+                use_auth_token=hf_token
+            ).to(torch.device(self.device))
             
             diarization = pipeline(audio_path)
             
-            # Convert to list of {start, end, speaker}
-            speaker_segments = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                if self.stop_event_set: raise InterruptedError("Cancelled")
-                speaker_segments.append({
-                    "start": turn.start,
-                    "end": turn.end,
-                    "speaker": speaker
-                })
+            # 3. Merge Whisper + Diarization
+            if self.progress_callback: self.progress_callback(80, "Łączenie wyników...")
+            final_segments = self._assign_speakers(transcript_segments, diarization)
             
-            self.progress(100, "diarizing")
-            return speaker_segments
-            
+            if self.progress_callback: self.progress_callback(100, "Gotowe!")
+            return final_segments
+
         except Exception as e:
-            logger.error(f"Diarization Error: {e}")
-            self.log(f"Diarization failed: {e}")
-            return []
+            self.logger.error(f"Transcription error: {e}")
+            raise e
 
-    def _merge_transcript_speakers(self, transcript_segments, speaker_segments):
+    def _assign_speakers(self, transcript_segments, diarization_result):
         """
-        Assigns a speaker to each transcript segment based on time overlap.
+        Prosty algorytm mapowania segmentów czasowych Whisper na mówców z Pyannote.
         """
-        if not speaker_segments:
-            return transcript_segments # Return plain transcript if no speakers
-
-        for t_seg in transcript_segments:
-            # Find speaker segment with max overlap
-            best_speaker = "Unknown"
-            max_overlap = 0
+        final_output = []
+        
+        for seg in transcript_segments:
+            # Znajdź mówcę, który mówił najdłużej w czasie trwania segmentu
+            seg_start = seg["start"]
+            seg_end = seg["end"]
             
-            t_start = t_seg["start"]
-            t_end = t_seg["end"]
-            t_dur = t_end - t_start
-            
-            for s_seg in speaker_segments:
-                # Calculate overlap
-                start = max(t_start, s_seg["start"])
-                end = min(t_end, s_seg["end"])
-                overlap = max(0, end - start)
+            # Pobranie wszystkich nakładających się segmentów mówców
+            speakers = []
+            for turn, _, speaker in diarization_result.itertracks(yield_label=True):
+                # Sprawdź przecięcie (intersection)
+                intersection_start = max(seg_start, turn.start)
+                intersection_end = min(seg_end, turn.end)
                 
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    best_speaker = s_seg["speaker"]
+                if intersection_end > intersection_start:
+                    duration = intersection_end - intersection_start
+                    speakers.append((speaker, duration))
             
-            # Logic: If overlap is significant relative to segment duration, assign speaker
-            if max_overlap > 0:
-                t_seg["speaker"] = best_speaker
+            # Wybierz dominującego mówcę
+            if speakers:
+                best_speaker = max(speakers, key=lambda x: x[1])[0]
+                seg["speaker"] = best_speaker
             else:
-                t_seg["speaker"] = "Unknown"
+                seg["speaker"] = "Unknown"
                 
-        return transcript_segments
-
-    def save_to_obsidian(self, segments, title, url=None):
-        """
-        Formats the processed segments into a Markdown note and saves it to the Vault.
-        """
-        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
-        filename = f"{safe_title}.md"
-        path = ProjectConfig.OBSIDIAN_VAULT / filename
-        
-        content = f"# {title}\n\n"
-        if url:
-            content += f"**Source:** {url}\n\n"
-        
-        content += "## Transcription\n\n"
-        
-        current_speaker = None
-        
-        for seg in segments:
-            speaker = seg.get("speaker", None)
-            start_fmt = str(timedelta(seconds=int(seg['start'])))
+            final_output.append(seg)
             
-            if speaker and speaker != current_speaker:
-                content += f"\n**{speaker}** ({start_fmt}):\n"
-                current_speaker = speaker
-            elif not speaker:
-                 content += f"**[{start_fmt}]** "
-
-            content += f"{seg['text']} "
-            
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-            
-        self.log(f"Saved note to: {path}")
-        return path
+        return final_output

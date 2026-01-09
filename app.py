@@ -1,10 +1,15 @@
 import streamlit as st
 import os
 import shutil
+import warnings
 from pathlib import Path
 
 # Imports
 from config import ProjectConfig, logger
+
+# SILENCE TORCH AUDIO WARNINGS
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Torchaudio's I/O functions.*")
+
 from ai_notes import TranscriptProcessor
 from rag_engine import ObsidianRAG
 from video_transcriber import VideoTranscriber
