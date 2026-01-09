@@ -1,0 +1,21 @@
+# Środowisko Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Zmienne środowiskowe i klucze
+.env
+
+# Dane aplikacji (BARDZO WAŻNE - nie wysyłamy tego)
+obsidian_db/
+Education/
+processed_news.json
+*.log
+
+# Systemowe
+.DS_Store
+Thumbs.db
+
+# Tymczasowe
+tmp/
