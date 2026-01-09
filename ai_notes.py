@@ -1,130 +1,163 @@
 import os
 import argparse
-from datetime import datetime
-import ollama
 import re
+import ollama
+import logging
+from datetime import datetime
 from tqdm import tqdm
-from obsidian_manager import ObsidianGardener  # Import Ogrodnika
+from typing import List, Optional, Tuple
 
-# --- KONFIGURACJA ---
-OBSIDIAN_VAULT_PATH = os.path.join(os.getcwd(), "Education")
-OLLAMA_MODEL = "bielik"
-CHUNK_SIZE = 6000
-OVERLAP = 500
+# Use centralized config
+from config import ProjectConfig, logger
+from obsidian_manager import ObsidianGardener
 
-# --- PRECYZYJNY PROMPT ---
-SYSTEM_PROMPT = """
-Jesteś Ekspertem Technicznym i Analitykiem Cyberbezpieczeństwa. Tworzysz precyzyjną dokumentację techniczną w formacie Obsidian Markdown.
+class TranscriptProcessor:
+    """
+    Handles the processing of raw transcripts into structured Obsidian technical notes.
+    Refactored to be importable and state-aware.
+    """
+    
+    SYSTEM_PROMPT = """
+    Jesteś Ekspertem Technicznym i Analitykiem Cyberbezpieczeństwa. Tworzysz precyzyjną dokumentację techniczną w formacie Obsidian Markdown.
 
-Twoje zadanie: Przeanalizuj podany transkrypt wideo/szkolenia i stwórz zwięzłą, techniczną notatkę.
+    Twoje zadanie: Przeanalizuj podany transkrypt wideo/szkolenia i stwórz zwięzłą, techniczną notatkę.
 
-WYMAGANIA FORMATOWANIA:
-1. Używaj TYLKO nagłówków H2 (##) dla głównych sekcji. Nie używaj H1 (tytuł jest w metadanych).
-2. Kluczowe pojęcia, narzędzia i technologie pogrubiaj (np. **nmap**, **SQL Injection**).
-3. WSZYSTKIE komendy, ścieżki plików, fragmenty kodu i logi umieszczaj w blokach kodu:
-   ```bash
-   nmap -sV 192.168.1.1
-   ```
-4. Ignoruj całkowicie dygresje, żarty, powitania ("Cześć", "Dajcie suba") i lanie wody.
-5. Pisz w stylu bezosobowym, technicznym (np. "Należy wykonać skan...", "Podatność polega na...").
-6. Jeśli fragment nie zawiera konkretnej wiedzy, pomiń go.
+    WYMAGANIA FORMATOWANIA:
+    1. Używaj TYLKO nagłówków H2 (##) dla głównych sekcji. Nie używaj H1 (tytuł jest w metadanych).
+    2. Kluczowe pojęcia, narzędzia i technologie pogrubiaj (np. **nmap**, **SQL Injection**).
+    3. WSZYSTKIE komendy, ścieżki plików, fragmenty kodu i logi umieszczaj w blokach kodu:
+       ```bash
+       nmap -sV 192.168.1.1
+       ```
+    4. Ignoruj całkowicie dygresje, żarty, powitania ("Cześć", "Dajcie suba") i lanie wody.
+    5. Pisz w stylu bezosobowym, technicznym (np. "Należy wykonać skan...", "Podatność polega na...").
+    6. Jeśli fragment nie zawiera konkretnej wiedzy, pomiń go.
 
-CELEM JEST DOKŁADNOŚĆ. Nie zmyślaj. Opieraj się tylko na tekście.
-"""
+    CELEM JEST DOKŁADNOŚĆ. Nie zmyślaj. Opieraj się tylko na tekście.
+    """
 
-def clean_filename(title):
-    title = title.lower()
-    title = re.sub(r'[^\w\s-]', '', title)
-    return re.sub(r'[\s_-]+', '-', title).strip('-')
+    def __init__(self, vault_path: Optional[str] = None, model: str = None):
+        """
+        Initialize the processor with configurable vault path and model.
+        """
+        self.vault_path = vault_path if vault_path else str(ProjectConfig.OBSIDIAN_VAULT)
+        self.model = model if model else ProjectConfig.OLLAMA_MODEL
+        self.logger = logging.getLogger("TranscriptProcessor")
+        
+        # Ensure vault exists
+        os.makedirs(self.vault_path, exist_ok=True)
 
-def create_chunks(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
-    chunks = []
-    start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start += chunk_size - overlap
-    return chunks
+    def clean_filename(self, title: str) -> str:
+        """Sanitizes the title for filesystem safety."""
+        title = title.lower()
+        title = re.sub(r'[^\w\s-]', '', title)
+        return re.sub(r'[\s_-]+', '-', title).strip('-')
 
-def generate_title_and_summary(full_text_sample):
-    prompt = "Jesteś bibliotekarzem. Na podstawie tego fragmentu stwórz: 1. Krótki techniczny tytuł (max 6 słów, bez znaków specjalnych). 2. Jedno zdanie streszczenia."
-    try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL, 
-            messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': full_text_sample[:2000]}],
-            options={'temperature': 0.3} # Precyzja
+    def create_chunks(self, text: str, chunk_size: int = 6000, overlap: int = 500) -> List[str]:
+        """Splits text into overlapping chunks for context preservation."""
+        chunks = []
+        start = 0
+        text_len = len(text)
+        while start < text_len:
+            end = start + chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start += chunk_size - overlap
+        return chunks
+
+    def generate_metadata(self, text_sample: str) -> Tuple[str, str]:
+        """Generates a technical title and one-sentence summary."""
+        prompt = (
+            "Jesteś bibliotekarzem. Na podstawie tego fragmentu stwórz: "
+            "1. Krótki techniczny tytuł (max 6 słów, bez znaków specjalnych). "
+            "2. Jedno zdanie streszczenia."
         )
-        return response['message']['content']
-    except Exception as e:
-        print(f"[!] Błąd generowania tytułu: {e}")
-        return "Szkolenie Cybersec AutoNote"
-
-def process_transcript(file_path):
-    print(f"[*] Wczytywanie transkrypcji: {file_path}")
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            full_text = f.read()
-    except FileNotFoundError:
-        print("[!] Plik nie istnieje.")
-        return
-
-    print("[*] Analiza wstępna...")
-    meta_info = generate_title_and_summary(full_text)
-    
-    if meta_info:
-        lines = meta_info.split('\n')
-        raw_title = lines[0].replace('Tytuł:', '').strip()
-        safe_title = clean_filename(raw_title)[:60]
-    else:
-        safe_title = "unknown-training"
-    
-    chunks = create_chunks(full_text)
-    print(f"[*] Przetwarzanie {len(chunks)} fragmentów (Model: {OLLAMA_MODEL}, Temp: 0.2)...")
-
-    full_notes = []
-    
-    for i, chunk in enumerate(tqdm(chunks, desc="Analiza AI", unit="blok")):
         try:
             response = ollama.chat(
-                model=OLLAMA_MODEL, 
-                messages=[{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': chunk}],
-                options={'temperature': 0.2} # Niski parametr dla faktów
+                model=self.model, 
+                messages=[{'role': 'system', 'content': prompt}, 
+                          {'role': 'user', 'content': text_sample[:2000]}],
+                options={'temperature': 0.3} # Precision mode
             )
-            note_part = response['message']['content']
-            full_notes.append(f"\n## Część {i+1}\n{note_part}")
+            content = response['message']['content']
+            
+            # Simple parsing
+            lines = content.split('\n')
+            raw_title = lines[0].replace('Tytuł:', '').replace('1.', '').strip()
+            summary = lines[1].replace('Streszczenie:', '').replace('2.', '').strip() if len(lines) > 1 else "Brak podsumowania"
+            
+            return raw_title, summary
         except Exception as e:
-            full_notes.append(f"\n> [!ERROR] Błąd przetwarzania fragmentu {i+1}: {e}")
+            self.logger.error(f"Error generating metadata: {e}")
+            return "Szkolenie Cybersec AutoNote", "Automatycznie wygenerowana notatka."
 
-    # Zapis
-    final_path = save_note(safe_title, meta_info, full_notes)
-    
-    # --- FAZA OGRODNIKA (POST-PROCESSING) ---
-    if final_path:
-        print(f"[*] Uruchamiam Ogrodnika (ObsidianGardener) dla: {final_path}")
-        gardener = ObsidianGardener(OBSIDIAN_VAULT_PATH)
-        success, msg = gardener.process_file(final_path)
-        if success:
-            print(f"[+] Ogrodnik: {msg}")
-        else:
-            print(f"[!] Ogrodnik zgłosił błąd: {msg}")
+    def process_transcript(self, file_path: str) -> Tuple[bool, str]:
+        """
+        Main logic to process a transcript file.
+        Returns: (Success (bool), Message/Path (str))
+        """
+        self.logger.info(f"Processing transcript: {file_path}")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                full_text = f.read()
+        except FileNotFoundError:
+            msg = f"File not found: {file_path}"
+            self.logger.error(msg)
+            return False, msg
 
-def save_note(title, intro, notes_list):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    date_prefix = datetime.now().strftime("%Y-%m-%d")
-    filename = f"{date_prefix}-{title}.md"
-    filepath = os.path.join(OBSIDIAN_VAULT_PATH, filename)
-    
-    joined_notes = "\n".join(notes_list)
+        # Step 1: Metadata
+        raw_title, summary = self.generate_metadata(full_text)
+        safe_title = self.clean_filename(raw_title)[:60] or "unknown-training"
+        
+        # Step 2: Chunking
+        chunks = self.create_chunks(full_text)
+        self.logger.info(f"Generated {len(chunks)} chunks using model {self.model}")
 
-    content = f"""---
+        # Step 3: AI Processing
+        full_notes = []
+        for i, chunk in enumerate(tqdm(chunks, desc="AI Analysis", unit="chunk")):
+            try:
+                response = ollama.chat(
+                    model=self.model, 
+                    messages=[{'role': 'system', 'content': self.SYSTEM_PROMPT}, 
+                              {'role': 'user', 'content': chunk}],
+                    options={'temperature': 0.2} 
+                )
+                note_part = response['message']['content']
+                full_notes.append(f"\n## Część {i+1}\n{note_part}")
+            except Exception as e:
+                err_msg = f"\n> [!ERROR] Chunk {i+1} processing failed: {e}"
+                self.logger.error(err_msg)
+                full_notes.append(err_msg)
+
+        # Step 4: Save
+        final_path = self.save_note(safe_title, summary, full_notes)
+        
+        # Step 5: Gardener (Auto-linking)
+        if final_path:
+            self.logger.info(f"Running Gardener on: {final_path}")
+            gardener = ObsidianGardener(self.vault_path)
+            success, msg = gardener.process_file(final_path)
+            return success, msg
+        
+        return False, "Failed to save note."
+
+    def save_note(self, title: str, intro: str, notes_list: List[str]) -> str:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{date_prefix}-{title}.md"
+        filepath = os.path.join(self.vault_path, filename)
+        
+        content = f"""
+--- 
 created: {timestamp}
 tags:
   - auto-generated
   - education
-  - transkrypt
+  - transcript
 status: to-review
+compliance: [TODO]
 ---
 
 # {title}
@@ -132,28 +165,33 @@ status: to-review
 > **Meta:** {intro}
 
 ---
-{joined_notes}
+{chr(10).join(notes_list)}
 
 ---
-*Generated by AI Bridge (Precision Mode)*
+*Generated by AI Bridge (Refactored Pipeline)*
 """
-    
-    if not os.path.exists(OBSIDIAN_VAULT_PATH):
-        os.makedirs(OBSIDIAN_VAULT_PATH)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
 
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
+        self.logger.info(f"Note saved: {filepath}")
+        return filepath
 
-    print(f"\n[SUCCESS] Zapisano surową notatkę: {filepath}")
-    return filepath
-
+# CLI Compatibility Wrapper
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("file", help="Ścieżka do pliku transkrypcji")
-    parser.add_argument("--output", help="Folder docelowy", default=OBSIDIAN_VAULT_PATH)
+    parser.add_argument("file", help="Path to transcript file")
+    parser.add_argument("--output", help="Target Obsidian folder")
+    parser.add_argument("--model", help="Ollama model to use")
+    
     args = parser.parse_args()
     
-    if args.output:
-        OBSIDIAN_VAULT_PATH = args.output
+    processor = TranscriptProcessor(
+        vault_path=args.output,
+        model=args.model
+    )
     
-    process_transcript(args.file)
+    success, msg = processor.process_transcript(args.file)
+    if success:
+        print(f"SUCCESS: {msg}")
+    else:
+        print(f"ERROR: {msg}")

@@ -3,27 +3,39 @@ import re
 import shutil
 import subprocess
 import time
+import logging
+from datetime import timedelta
 import requests
 import yt_dlp
 import torch
 from faster_whisper import WhisperModel
+from config import ProjectConfig
 
-# Domyślne wartości
-DEFAULT_MODEL_SIZE = "medium"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
+# Optional PyAnnote import
+try:
+    from pyannote.audio import Pipeline
+    PYANNOTE_AVAILABLE = True
+except ImportError:
+    PYANNOTE_AVAILABLE = False
+
+logger = logging.getLogger("VideoTranscriber")
 
 class VideoTranscriber:
     def __init__(self, log_callback=None, progress_callback=None):
         self.log = log_callback if log_callback else self._default_log
         self.progress = progress_callback if progress_callback else self._default_progress
-        self.stop_event_set = False # Simple flag instead of threading.Event for now
+        self.stop_event_set = False
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compute_type = "float16" if self.device == "cuda" else "int8"
+        
+        logger.info(f"VideoTranscriber initialized on {self.device} ({self.compute_type})")
 
     def _default_log(self, message):
-        print(f"[Log] {message}")
+        logger.info(message)
 
     def _default_progress(self, percent, stage, details=None):
-        print(f"[Progress] {stage}: {percent}% ({details})")
+        pass
 
     def stop(self):
         self.stop_event_set = True
@@ -38,71 +50,42 @@ class VideoTranscriber:
         )
         return re.match(youtube_regex, url.strip())
 
-    def get_file_size(self, filepath):
-        try:
-            size = os.path.getsize(filepath)
-            for unit in ['B', 'KB', 'MB', 'GB']:
-                if size < 1024.0:
-                    return f"{size:.2f} {unit}"
-                size /= 1024.0
-            return f"{size:.2f} TB"
-        except:
-            return "Unknown"
-
-    def download_video(self, url, save_path, quality="best", audio_quality="192"):
+    def download_video(self, url, save_path=None, quality="best"):
         if self.stop_event_set: raise InterruptedError("Cancelled")
         
-        self.log(f"Pobieranie wideo z URL: {url} (Jakość: {quality})...")
+        # Use TEMP_DIR from config if save_path not provided
+        target_dir = save_path if save_path else str(ProjectConfig.TEMP_DIR)
+        
+        self.log(f"Downloading video from: {url} to {target_dir}")
         self.progress(0, "downloading")
 
-        common_opts = {
-            "outtmpl": os.path.join(save_path, "% (title)s.%(ext)s"),
+        ydl_opts = {
+            "outtmpl": os.path.join(target_dir, "% (title)s.%(ext)s"),
             "progress_hooks": [self._yt_dlp_hook],
             "writethumbnail": False,
             "writeinfojson": False,
             "keepvideo": False,
             "noplaylist": True,
-            "socket_timeout": 30,
-        }
-
-        if quality == "audio_only":
-            ydl_opts = {
-                **common_opts,
-                "format": "bestaudio/best",
-                "postprocessors": [{
+            "format": "bestaudio/best", # Prefer audio for transcription efficiency
+            "postprocessors": [
+                {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
-                    "preferredquality": audio_quality,
-                }],
-            }
-        else: # best or worst video
-            fmt = "bestvideo+bestaudio/best" if quality == "best" else "worst"
-            ydl_opts = {
-                **common_opts,
-                "format": fmt,
-                "merge_output_format": "mp4",
-                "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-            }
+                    "preferredquality": "192",
+                },
+            ],
+        }
 
         filename = ""
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
+                # yt-dlp with postprocessor changes ext to mp3
+                filename = os.path.splitext(filename)[0] + ".mp3"
                 
-                # Fix filename extension for audio_only
-                base = os.path.splitext(filename)[0]
-                if quality == "audio_only":
-                    filename = base + ".mp3"
-                else:
-                    filename = base + ".mp4"
-                
-                if os.path.exists(filename):
-                    size_str = self.get_file_size(filename)
-                    self.log(f"Pobrano plik: {filename} ({size_str})")
-
         except Exception as e:
-            raise Exception(f"Błąd pobierania: {str(e)}")
+            raise Exception(f"Download failed: {str(e)}")
 
         self.progress(100, "downloading")
         return filename
@@ -112,130 +95,155 @@ class VideoTranscriber:
         if d["status"] == "downloading":
             try:
                 p = d.get("_percent_str", "0%").replace("%", "")
-                percent = float(p)
-                self.progress(percent, "downloading")
+                self.progress(float(p), "downloading")
             except: pass
 
-    def convert_to_mp3(self, input_path, output_path=None):
+    def transcribe_and_diarize(self, audio_path, language="pl", model_size="medium", use_diarization=True):
         if self.stop_event_set: raise InterruptedError("Cancelled")
-        
-        if not output_path:
-            base, _ = os.path.splitext(input_path)
-            output_path = base + ".mp3"
 
-        self.log(f"Konwersja do MP3: {os.path.basename(input_path)} -> {os.path.basename(output_path)}")
-        self.progress(0, "converting")
+        # 1. Transcription (Whisper)
+        self.log(f"Starting Whisper transcription ({model_size})...")
+        segments = self._run_whisper(audio_path, language, model_size)
 
-        try:
-            cmd = [
-                "ffmpeg", "-y",
-                "-loglevel", "error", "-nostats",
-                "-i", input_path,
-                "-codec:a", "libmp3lame",
-                "-qscale:a", "2",
-                output_path
-            ]
-            
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.progress(100, "converting")
-            return output_path
-        except subprocess.CalledProcessError as e:
-            raise Exception(f"Błąd FFmpeg: {e.stderr.decode() if e.stderr else str(e)}")
-        except Exception as e:
-            raise Exception(f"Błąd konwersji: {str(e)}")
+        # 2. Diarization (PyAnnote) - Optional
+        speakers = {}
+        if use_diarization and PYANNOTE_AVAILABLE:
+            if ProjectConfig.HF_TOKEN:
+                self.log("Starting Speaker Diarization (PyAnnote)...")
+                speakers = self._run_diarization(audio_path)
+            else:
+                self.log("Skipping Diarization: HF_TOKEN not set in Config (.env).")
+        elif use_diarization and not PYANNOTE_AVAILABLE:
+            self.log("Skipping Diarization: pyannote.audio not installed.")
 
-    def transcribe_video(self, filename, language="pl", model_size=DEFAULT_MODEL_SIZE):
-        if self.stop_event_set: raise InterruptedError("Cancelled")
-        
-        self.log(f"Inicjalizacja modelu Whisper ({model_size}) na {DEVICE}...")
-        
-        models_dir = os.path.join(os.getcwd(), "models")
-        os.makedirs(models_dir, exist_ok=True)
+        # 3. Merge
+        final_transcript = self._merge_transcript_speakers(segments, speakers)
+        return final_transcript
 
-        try:
-            model = WhisperModel(model_size, device=DEVICE, compute_type=COMPUTE_TYPE, download_root=models_dir)
-        except Exception as e:
-            raise Exception(f"Nie można załadować modelu Whisper: {str(e)}")
-
-        self.log(f"Rozpoczynam transkrypcję pliku: {os.path.basename(filename)}")
+    def _run_whisper(self, audio_path, language, model_size):
         self.progress(0, "transcribing")
-
         try:
-            segments, info = model.transcribe(
-                filename,
+            # Load model (cache in Project defined cache or default)
+            model = WhisperModel(model_size, device=self.device, compute_type=self.compute_type)
+            
+            segments_generator, info = model.transcribe(
+                audio_path,
                 language=language if language != "auto" else None,
                 beam_size=5,
-                vad_filter=True,
+                vad_filter=True
             )
             
-            # Faster Whisper returns a generator, so we iterate to get progress
-            # However, we don't know total duration easily unless we probe file or use info.duration
-            
-            collected_segments = []
-            total_duration = info.duration
-            
-            for segment in segments:
+            segments = []
+            for segment in segments_generator:
                 if self.stop_event_set: raise InterruptedError("Cancelled")
-                collected_segments.append(segment)
-                if total_duration > 0:
-                    percent = (segment.end / total_duration) * 100
-                    self.progress(min(percent, 99), "transcribing")
+                segments.append({
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text.strip()
+                })
+                # Simple progress update (fake, as we don't know exact duration easily inside loop without pre-check)
+                self.progress(50, "transcribing", details=f"{segment.end:.1f}s processed")
             
             self.progress(100, "transcribing")
-            return collected_segments, info
+            return segments
             
         except Exception as e:
-            raise Exception(f"Błąd transkrypcji: {str(e)}")
+            logger.error(f"Whisper Error: {e}")
+            raise
 
-    def save_transcription(self, segments, info, output_path_base):
-        # Save as simple TXT with timestamps
-        txt_path = output_path_base + "_transkrypcja.txt"
-        
-        full_text = ""
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(f"Język wykryty: {info.language} (pewność: {info.language_probability:.2%})\n")
-            f.write("-" * 40 + "\n\n")
-            
-            for segment in segments:
-                line = f"[{self._format_time(segment.start)} -> {self._format_time(segment.end)}] {segment.text}\n"
-                f.write(line)
-                full_text += segment.text + " "
-        
-        return txt_path, full_text.strip()
-
-    def _format_time(self, seconds):
-        m, s = divmod(int(seconds), 60)
-        return f"{m:02d}:{s:02d}"
-
-    def summarize_text(self, text, model_name="bielik", style="standard"):
-        if self.stop_event_set: raise InterruptedError("Cancelled")
-        
-        self.log("Generowanie podsumowania przez Ollama...")
-        self.progress(0, "summarizing")
-        
-        # Simple prompt logic
-        if style == "short":
-            prompt_instruction = "Napisz bardzo krótkie streszczenie tego tekstu w jednym akapicie (po polsku)."
-        elif style == "detailed":
-            prompt_instruction = "Sporządź szczegółowe podsumowanie, uwzględniając najważniejsze wątki techniczne."
-        else:
-            prompt_instruction = "Stwórz zwięzłe podsumowanie w punktach (po polsku)."
-
-        prompt = f"{prompt_instruction} Tekst:\n\n{text[:15000]}" # Limit context
-
+    def _run_diarization(self, audio_path):
+        self.progress(0, "diarizing")
         try:
-            response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": model_name, "prompt": prompt, "stream": False},
-                timeout=300,
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=ProjectConfig.HF_TOKEN
             )
+            pipeline.to(torch.device(self.device))
             
-            if response.status_code == 200:
-                self.progress(100, "summarizing")
-                return response.json().get("response")
-            else:
-                self.log(f"Błąd Ollama: {response.status_code}")
-                return None
+            diarization = pipeline(audio_path)
+            
+            # Convert to list of {start, end, speaker}
+            speaker_segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                if self.stop_event_set: raise InterruptedError("Cancelled")
+                speaker_segments.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": speaker
+                })
+            
+            self.progress(100, "diarizing")
+            return speaker_segments
+            
         except Exception as e:
-            self.log(f"Błąd połączenia z Ollama: {e}")
-            return None
+            logger.error(f"Diarization Error: {e}")
+            self.log(f"Diarization failed: {e}")
+            return []
+
+    def _merge_transcript_speakers(self, transcript_segments, speaker_segments):
+        """
+        Assigns a speaker to each transcript segment based on time overlap.
+        """
+        if not speaker_segments:
+            return transcript_segments # Return plain transcript if no speakers
+
+        for t_seg in transcript_segments:
+            # Find speaker segment with max overlap
+            best_speaker = "Unknown"
+            max_overlap = 0
+            
+            t_start = t_seg["start"]
+            t_end = t_seg["end"]
+            t_dur = t_end - t_start
+            
+            for s_seg in speaker_segments:
+                # Calculate overlap
+                start = max(t_start, s_seg["start"])
+                end = min(t_end, s_seg["end"])
+                overlap = max(0, end - start)
+                
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    best_speaker = s_seg["speaker"]
+            
+            # Logic: If overlap is significant relative to segment duration, assign speaker
+            if max_overlap > 0:
+                t_seg["speaker"] = best_speaker
+            else:
+                t_seg["speaker"] = "Unknown"
+                
+        return transcript_segments
+
+    def save_to_obsidian(self, segments, title, url=None):
+        """
+        Formats the processed segments into a Markdown note and saves it to the Vault.
+        """
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+        filename = f"{safe_title}.md"
+        path = ProjectConfig.OBSIDIAN_VAULT / filename
+        
+        content = f"# {title}\n\n"
+        if url:
+            content += f"**Source:** {url}\n\n"
+        
+        content += "## Transcription\n\n"
+        
+        current_speaker = None
+        
+        for seg in segments:
+            speaker = seg.get("speaker", None)
+            start_fmt = str(timedelta(seconds=int(seg['start'])))
+            
+            if speaker and speaker != current_speaker:
+                content += f"\n**{speaker}** ({start_fmt}):\n"
+                current_speaker = speaker
+            elif not speaker:
+                 content += f"**[{start_fmt}]** "
+
+            content += f"{seg['text']} "
+            
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+            
+        self.log(f"Saved note to: {path}")
+        return path

@@ -1,279 +1,211 @@
 import streamlit as st
 import os
-import subprocess
 import shutil
-import feedparser
+from pathlib import Path
+
+# Imports
+from config import ProjectConfig
+from ai_notes import TranscriptProcessor
 from rag_engine import ObsidianRAG
 from video_transcriber import VideoTranscriber
+from news_agent import NewsAgent
+from ai_research import WebResearcher
 
-# --- KONFIGURACJA ---
-# Domyślne ścieżki (można nadpisać w UI)
-DEFAULT_INPUT_DIR = "/mnt/d/transkrypcje"
-DEFAULT_VAULT_PATH = "/mnt/c/Users/marci/Documents/Obsidian Vault/Education"
+# --- CONFIG & INIT ---
+st.set_page_config(page_title="Obsidian AI Bridge v2", layout="wide", page_icon="🧠")
 
-# Fallback jeśli dysk D: nie istnieje (np. inne środowisko)
-if not os.path.exists(DEFAULT_INPUT_DIR):
-    DEFAULT_INPUT_DIR = os.path.join(os.getcwd(), "downloads")
-    os.makedirs(DEFAULT_INPUT_DIR, exist_ok=True)
+# Ensure directories exist via Config
+ProjectConfig.validate_paths()
 
-RSS_FEEDS = {
-    "Sekurak": "https://feeds.feedburner.com/sekurak",
-    "Niebezpiecznik": "https://feeds.feedburner.com/niebezpiecznik",
-    "Zaufana Trzecia Strona": "https://zaufanatrzeciastrona.pl/feed/",
-    "ZTS - Weekendowa Lektura": "https://zaufanatrzeciastrona.pl/tag/weekendowa-lektura/feed/"
-}
-
-# --- INIT ---
-st.set_page_config(page_title="Obsidian AI Bridge", layout="wide", page_icon="🧠")
-
-# Inicjalizacja Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- SIDEBAR: NAWIGACJA ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.title("🧠 Drugi Mózg")
+    st.title("🧠 Second Brain v2")
+    st.caption("Secure • Modular • Local")
     st.markdown("---")
     
     mode = st.radio(
-        "Wybierz tryb pracy:",
+        "Tryb pracy:",
         [
-            "📥 Import: Wideo & Audio",
-            "🌍 Import: Web & News",
-            "📄 Import: Dokumenty PDF",
-            "🏭 Przetwarzanie (Inbox)",
-            "🔎 Eksploracja (RAG Chat)"
+            "📥 Import: Wideo/Audio",
+            "🌐 Research & News",
+            "🏭 Inbox (Przetwarzanie)",
+            "🔎 RAG Chat (Baza Wiedzy)",
+            "⚙️ Ustawienia"
         ]
     )
     
     st.markdown("---")
-    st.markdown("### ⚙️ Ustawienia Globalne")
+    st.info(f"Vault: `{ProjectConfig.OBSIDIAN_VAULT.name}`")
+    st.info(f"Model: `{ProjectConfig.OLLAMA_MODEL}`")
+
+# --- UTILS ---
+def get_transcriber_callback(progress_bar, status_text):
+    def update_progress(percent, stage, details=None):
+        progress_bar.progress(int(percent))
+        status_text.text(f"{stage.upper()}: {percent:.1f}% {details or ''}")
+    return update_progress
+
+# --- MAIN LOGIC ---
+
+# 1. IMPORT VIDEO
+if mode == "📥 Import: Wideo/Audio":
+    st.header("🎥 Media Ingestion Pipeline")
     
-    # Globalne ustawienia dostępne zawsze pod ręką
-    vault_path = st.text_input("Ścieżka do Obsidiana:", value=DEFAULT_VAULT_PATH)
-    input_dir = st.text_input("Folder Roboczy (Inbox):", value=DEFAULT_INPUT_DIR)
-    
-    selected_model = st.selectbox(
-        "Model AI (Ollama):",
-        ["bielik", "llama3.2", "deepseek-r1"],
-        index=0
-    )
-
-# --- FUNKCJE POMOCNICZE ---
-
-def run_ai_notes(file_path):
-    """Uruchamia generator notatek dla podanego pliku."""
-    try:
-        cmd = ["./venv/bin/python", "ai_notes.py", file_path, "--output", vault_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        return result.returncode == 0, result.stdout, result.stderr
-    except Exception as e:
-        return False, "", str(e)
-
-# --- GŁÓWNA LOGIKA APLIKACJI ---
-
-# 1. IMPORT WIDEO
-if mode == "📥 Import: Wideo & Audio":
-    st.header("🎥 Pobieranie i Transkrypcja")
-    st.markdown("Pobierz materiał z YouTube, dokonaj transkrypcji i (opcjonalnie) od razu utwórz notatkę.")
-
     col1, col2 = st.columns([2, 1])
     with col1:
         video_url = st.text_input("YouTube URL:")
-        local_file = st.text_input("Lub ścieżka do pliku lokalnego:")
+        uploaded_file = st.file_uploader("Lub wgraj plik (MP3/MP4/WAV):")
     with col2:
-        whisper_model = st.selectbox("Dokładność (Whisper)", ["base", "small", "medium", "large-v3"], index=2)
-    
-    st.markdown("#### Opcje Pipeline'u")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        do_transcribe = st.checkbox("1. Transkrybuj (Whisper)", value=True)
-    with c2:
-        do_summarize = st.checkbox("2. Szybkie Podsumowanie", value=True)
-    with c3:
-        do_obsidian = st.checkbox("3. Auto-Notatka Obsidian", value=False, help="Od razu uruchamia generator notatek po transkrypcji.")
+        model_size = st.selectbox("Model Whisper", ["base", "small", "medium", "large-v3"], index=1)
+        do_obsidian = st.checkbox("Auto-Notatka (Obsidian)", value=True)
 
     if st.button("🚀 Uruchom Proces", type="primary"):
-        if not video_url and not local_file:
-            st.error("Podaj źródło (URL lub plik)!")
-        else:
-            # Kontener statusu
-            status_container = st.container()
-            progress_bar = status_container.progress(0)
-            status_text = status_container.empty()
-            
-            def update_progress(percent, stage, details=None):
-                progress_bar.progress(int(percent))
-                status_text.text(f"{stage.upper()}: {percent:.1f}% {details or ''}")
-            
-            transcriber = VideoTranscriber(log_callback=lambda x: None, progress_callback=update_progress)
-            
-            try:
-                # KROK 1: POBIERANIE
-                if video_url:
-                    status_text.text("Pobieranie wideo...")
-                    target_file = transcriber.download_video(video_url, save_path=input_dir)
-                else:
-                    target_file = local_file
-                
-                status_text.text(f"Gotowy do pracy: {os.path.basename(target_file)}")
-                
-                # KROK 2: TRANSKRYPCJA
-                txt_path = None
-                if do_transcribe:
-                    segments, info = transcriber.transcribe_video(target_file, language="pl", model_size=whisper_model) # Hardcoded PL for simplicity, or add selector back
-                    txt_path, full_text = transcriber.save_transcription(segments, info, os.path.splitext(target_file)[0])
-                    st.success(f"Transkrypcja gotowa: `{os.path.basename(txt_path)}`")
-
-                    # KROK 3: PODSUMOWANIE (TXT)
-                    if do_summarize and full_text:
-                        status_text.text("Generowanie podsumowania...")
-                        summary = transcriber.summarize_text(full_text)
-                        if summary:
-                            sum_path = os.path.splitext(target_file)[0] + "_podsumowanie.txt"
-                            with open(sum_path, "w", encoding="utf-8") as f:
-                                f.write(summary)
-                            st.info("Podsumowanie zapisane.")
-
-                    # KROK 4: OBSIDIAN (AUTO)
-                    if do_obsidian and txt_path:
-                        status_text.text("Generowanie notatki Obsidian...")
-                        success, out, err = run_ai_notes(txt_path)
-                        if success:
-                            st.balloons()
-                            st.success("✅ Notatka utworzona w Obsidianie!")
-                            with st.expander("Szczegóły notatki"):
-                                st.text(out)
-                        else:
-                            st.error("Błąd generowania notatki.")
-                            st.text(err)
-                
-                status_text.text("Proces zakończony.")
-                progress_bar.progress(100)
-
-            except Exception as e:
-                st.error(f"Wystąpił błąd: {e}")
-
-# 2. IMPORT WEB & NEWS
-elif mode == "🌍 Import: Web & News":
-    st.header("🌍 Internet Research & News")
-    
-    tab_news1, tab_news2 = st.tabs(["Pojedynczy Artykuł", "Centrum RSS"])
-    
-    with tab_news1:
-        url = st.text_input("Wklej adres URL artykułu do analizy:")
-        if st.button("Analizuj i Notuj"):
-            if url:
-                with st.spinner(f"Agent czyta: {url}..."):
-                    try:
-                        cmd = ["./venv/bin/python", "ai_research.py", url]
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        if result.returncode == 0:
-                            st.success("Notatka dodana do Obsidiana!")
-                            st.expander("Logi").text(result.stdout)
-                        else:
-                            st.error("Błąd.")
-                            st.text(result.stderr)
-                    except Exception as e:
-                        st.error(str(e))
-
-    with tab_news2:
-        st.info("Agent RSS automatycznie pobiera nowości, filtruje je i tworzy prasówkę.")
-        if st.button("Uruchom Agenta Newsowego"):
-            with st.status("Przeglądam internet...", expanded=True):
-                cmd = ["./venv/bin/python", "news_agent.py"]
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                stdout, stderr = process.communicate()
-                st.write(stdout)
-                if stderr:
-                    st.error(stderr)
-            st.success("Gotowe.")
-
-# 3. IMPORT PDF
-elif mode == "📄 Import: Dokumenty PDF":
-    st.header("📄 Przetwarzanie Dokumentów PDF")
-    uploaded_file = st.file_uploader("Wrzuć plik PDF", type="pdf")
-    
-    if uploaded_file and st.button("Analizuj PDF"):
-        with st.spinner("Przetwarzanie..."):
-            temp_path = os.path.join("/tmp", uploaded_file.name)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            try:
-                # PDF Shredder logic
-                cmd = ["./venv/bin/python", "pdf_shredder.py", temp_path]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    st.success("Treść wyciągnięta i przeanalizowana!")
-                    st.text(result.stdout)
-                else:
-                    st.error("Błąd PDF Shreddera.")
-                    st.text(result.stderr)
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-# 4. PRZETWARZANIE (INBOX)
-elif mode == "🏭 Przetwarzanie (Inbox)":
-    st.header("🏭 Fabryka Wiedzy")
-    st.markdown(f"Pliki oczekujące w: `{input_dir}`")
-    
-    if not os.path.exists(input_dir):
-        st.warning("Folder Inbox nie istnieje.")
-    else:
-        # Filtrujemy tylko txt, które nie są systemowe
-        files = [f for f in os.listdir(input_dir) if f.endswith('.txt') and "_podsumowanie" not in f and "processed" not in f]
+        status_container = st.container()
+        p_bar = status_container.progress(0)
+        s_text = status_container.empty()
         
-        if not files:
-            st.info("Skrzynka odbiorcza jest pusta. Dobra robota! 🎉")
-        else:
-            st.write(f"Oczekujące transkrypcje: {len(files)}")
+        try:
+            transcriber = VideoTranscriber(
+                log_callback=lambda x: None, 
+                progress_callback=get_transcriber_callback(p_bar, s_text)
+            )
             
-            for f in files:
-                with st.expander(f"📄 {f}", expanded=False):
-                    col_a, col_b = st.columns([3, 1])
-                    with col_a:
-                        st.caption("Podgląd (pierwsze 500 znaków):")
-                        try:
-                            with open(os.path.join(input_dir, f), 'r', encoding='utf-8') as file_obj:
-                                content = file_obj.read(500)
-                                st.text(content + "...")
-                        except:
-                            st.text("Nie można odczytać podglądu.")
-                    
-                    with col_b:
-                        if st.button(f"Generuj Notatkę", key=f"gen_{f}"):
-                            with st.spinner("Przetwarzanie..."):
-                                full_path = os.path.join(input_dir, f)
-                                success, out, err = run_ai_notes(full_path)
-                                if success:
-                                    st.success("Gotowe!")
-                                    # Opcjonalnie: przenieś do processed
-                                    processed_dir = os.path.join(input_dir, "processed")
-                                    os.makedirs(processed_dir, exist_ok=True)
-                                    shutil.move(full_path, os.path.join(processed_dir, f))
-                                    st.rerun()
-                                else:
-                                    st.error(err)
+            target_file = None
+            
+            # 1. Acquire Media
+            if video_url:
+                s_text.text("Pobieranie wideo...")
+                target_file = transcriber.download_video(video_url, save_path=str(ProjectConfig.TEMP_DIR))
+            elif uploaded_file:
+                target_file = ProjectConfig.TEMP_DIR / uploaded_file.name
+                with open(target_file, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                target_file = str(target_file)
+            
+            if target_file:
+                # 2. Transcribe & Diarize
+                s_text.text("Transkrypcja i Diaryzacja (może potrwać)...")
+                segments = transcriber.transcribe_and_diarize(
+                    target_file, 
+                    language="pl", 
+                    model_size=model_size,
+                    use_diarization=True
+                )
+                
+                # Save raw transcript for Processor
+                base_name = os.path.splitext(target_file)[0]
+                txt_path = base_name + "_full_transcript.txt"
+                
+                # Format text for LLM (include speaker info)
+                full_text = ""
+                for seg in segments:
+                    speaker_prefix = f"[{seg.get('speaker', 'Unknown')}]: " if 'speaker' in seg else ""
+                    full_text += f"{speaker_prefix}{seg['text']}\n"
+                
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(full_text)
+                
+                st.success(f"Transkrypcja gotowa: `{os.path.basename(txt_path)}`")
 
-# 5. EKSPLORACJA (RAG)
-elif mode == "🔎 Eksploracja (RAG Chat)":
+                # 3. AI Processing
+                if do_obsidian:
+                    s_text.text("Generowanie notatki AI...")
+                    processor = TranscriptProcessor()
+                    success, msg = processor.process_transcript(txt_path)
+                    
+                    if success:
+                        st.balloons()
+                        st.success(f"✅ Notatka utworzona: {os.path.basename(msg)}")
+                        with st.expander("Podgląd ścieżki"):
+                            st.code(msg)
+                    else:
+                        st.error(f"Błąd generatora: {msg}")
+
+        except Exception as e:
+            st.error(f"Critical Error: {e}")
+
+# 2. RESEARCH & NEWS
+elif mode == "🌐 Research & News":
+    st.header("🌐 AI Research & News")
+    
+    tab1, tab2 = st.tabs(["🔎 Web Researcher", "📰 News Agent"])
+    
+    with tab1:
+        st.subheader("Analiza Artykułu Technicznego")
+        url = st.text_input("Wklej link do artykułu/dokumentacji:")
+        if st.button("Analizuj Artykuł"):
+            with st.spinner("Pobieranie i analizowanie..."):
+                researcher = WebResearcher()
+                success = researcher.process_url(url)
+                if success:
+                    st.success("Analiza zakończona! Notatka zapisana w folderze 'Research'.")
+                else:
+                    st.error("Błąd podczas analizy.")
+                    
+    with tab2:
+        st.subheader("Agregator Cyber Newsów")
+        st.write("Automatycznie pobiera i streszcza newsy z zaufanych źródeł (Sekurak, ZTS, etc.)")
+        if st.button("Uruchom Agenta Newsowego"):
+            with st.status("Przetwarzanie newsów...", expanded=True) as status:
+                agent = NewsAgent()
+                count = agent.run()
+                status.update(label=f"Gotowe! Przetworzono {count} nowych artykułów.", state="complete")
+            if count > 0:
+                st.balloons()
+
+# 3. INBOX PROCESSING
+elif mode == "🏭 Inbox (Przetwarzanie)":
+    st.header("🏭 Fabryka Wiedzy (Inbox)")
+    
+    # Scan Temp Dir for .txt files
+    txt_files = list(ProjectConfig.TEMP_DIR.glob("*.txt"))
+    
+    if not txt_files:
+        st.info("Skrzynka odbiorcza pusta.")
+    else:
+        st.write(f"Znaleziono {len(txt_files)} plików do przetworzenia.")
+        
+        for txt_file in txt_files:
+            if "processed" in txt_file.name: continue
+
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.text(f"📄 {txt_file.name}")
+            with col2:
+                if st.button("Przetwórz", key=str(txt_file)):
+                    with st.spinner("Analizuję..."):
+                        processor = TranscriptProcessor()
+                        success, msg = processor.process_transcript(str(txt_file))
+                        if success:
+                            st.success("Gotowe!")
+                            processed_dir = ProjectConfig.TEMP_DIR / "processed"
+                            processed_dir.mkdir(exist_ok=True)
+                            shutil.move(str(txt_file), processed_dir / txt_file.name)
+                            st.rerun()
+                        else:
+                            st.error(f"Błąd: {msg}")
+
+# 4. RAG CHAT
+elif mode == "🔎 RAG Chat (Baza Wiedzy)":
     st.header("🔎 Rozmowa z Bazą Wiedzy")
     
     c1, c2 = st.columns([3, 1])
     with c2:
-        if st.button("🔄 Przeindeksuj Vault"):
-            with st.spinner("Indeksowanie..."):
+        if st.button("🔄 Aktualizuj Indeks"):
+            with st.status("Indeksowanie przyrostowe...", expanded=True) as status:
                 rag = ObsidianRAG()
-                c = rag.index_vault(vault_path)
-                st.success(f"Zaktualizowano: {c} fragmentów.")
+                count = rag.index_vault(ProjectConfig.OBSIDIAN_VAULT)
+                status.update(label=f"Zakończono! Dodano/Zmieniono {count} fragmentów.", state="complete")
     
-    # Chat UI
+    # Chat Interface
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
-    if prompt := st.chat_input("Zadaj pytanie swoim notatkom..."):
+    if prompt := st.chat_input("O co chcesz zapytać?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -283,15 +215,32 @@ elif mode == "🔎 Eksploracja (RAG Chat)":
             response_placeholder = st.empty()
             full_response = ""
             
-            # Prosty streaming (bez obsługi <think> dla uproszczenia kodu, można dodać)
-            for chunk in rag.query(prompt, history=st.session_state.messages[:-1], model_name=selected_model, stream=True):
-                 # Usuwanie tagów myślenia jeśli się pojawią (dla estetyki)
-                clean_chunk = chunk.replace("<think>", "**Myślę:**\n").replace("</think>", "\n---\n")
-                full_response += clean_chunk
+            # Streaming generator
+            gen = rag.query(
+                prompt, 
+                history=st.session_state.messages[:-1], 
+                model_name=ProjectConfig.OLLAMA_MODEL, 
+                stream=True
+            )
+            
+            for chunk in gen:
+                chunk = chunk.replace("<think>", "**Myślenie:**\n").replace("</think>", "\n---\n")
+                full_response += chunk
                 response_placeholder.markdown(full_response + "▌")
             
             response_placeholder.markdown(full_response)
             st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-st.sidebar.markdown("---")
-st.sidebar.caption("v2.0 • Unified Knowledge System")
+# 5. SETTINGS
+elif mode == "⚙️ Ustawienia":
+    st.header("Konfiguracja")
+    st.code(f"""
+    BASE_DIR: {ProjectConfig.BASE_DIR}
+    VAULT: {ProjectConfig.OBSIDIAN_VAULT}
+    DB_DIR: {ProjectConfig.DB_DIR}
+    LOG_FILE: {ProjectConfig.BASE_DIR / 'system.log'}
+    """, language="yaml")
+    
+    if st.button("Wyczyść Cache Streamlit"):
+        st.cache_data.clear()
+        st.success("Wyczyszczono.")

@@ -2,79 +2,99 @@ import feedparser
 import os
 import json
 import ollama
+import logging
 from datetime import datetime, timedelta
 from time import mktime
-from ai_research import fetch_article_content, clean_filename
+from typing import Set
 
-# --- KONFIGURACJA ---
-VAULT_PATH = "/mnt/c/Users/marci/Documents/Obsidian Vault/Education"
-NEWS_DIR = os.path.join(VAULT_PATH, "Newsy")
-HISTORY_FILE = "processed_news.json"
-MODEL = "bielik"  # Możesz zmienić na deepseek-r1
-DAYS_LOOKBACK = 3
+from config import ProjectConfig
+from ai_research import WebResearcher
 
-RSS_FEEDS = {
-    "Sekurak": "https://feeds.feedburner.com/sekurak",
-    "Niebezpiecznik": "https://feeds.feedburner.com/niebezpiecznik",
-    "Zaufana Trzecia Strona": "https://zaufanatrzeciastrona.pl/feed/",
-    "ZTS - Weekendowa": "https://zaufanatrzeciastrona.pl/tag/weekendowa-lektura/feed/"
-}
+logger = logging.getLogger("NewsAgent")
 
-SUMMARY_PROMPT = """
-Jesteś ekspertem cyberbezpieczeństwa. Twoim zadaniem jest przeczytanie artykułu i stworzenie SKONDENSOWANEGO podsumowania.
-
-WYMAGANIA:
-1. Podsumowanie musi mieć DOKŁADNIE 5 ZDAŃ.
-2. Skup się tylko na kluczowych informacjach: co się stało, jakie jest zagrożenie, jak się chronić.
-3. Jeśli artykuł jest o podatności (CVE), podaj numer CVE w jednym ze zdań.
-4. Język polski, styl profesjonalny i konkretny.
-"""
-
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
-
-def save_history(history_set):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(list(history_set), f)
-
-def analyze_article(url, title):
-    print(f"[*] Pobieranie: {title}")
-    _, content = fetch_article_content(url)
+class NewsAgent:
+    """
+    Automates fetching and summarizing cybersec news from RSS feeds.
+    """
     
-    if not content:
-        return None
+    RSS_FEEDS = {
+        "Sekurak": "https://feeds.feedburner.com/sekurak",
+        "Niebezpiecznik": "https://feeds.feedburner.com/niebezpiecznik",
+        "Zaufana Trzecia Strona": "https://zaufanatrzeciastrona.pl/feed/",
+        # "ZTS - Weekendowa": "https://zaufanatrzeciastrona.pl/tag/weekendowa-lektura/feed/"
+    }
 
-    # Ograniczenie treści dla szybkości (pierwsze 10k znaków zazwyczaj wystarcza dla newsa)
-    content = content[:10000]
+    SUMMARY_PROMPT = """
+    Jesteś ekspertem cyberbezpieczeństwa. Twoim zadaniem jest przeczytanie artykułu i stworzenie SKONDENSOWANEGO podsumowania.
 
-    try:
-        response = ollama.chat(model=MODEL, messages=[
-            {'role': 'system', 'content': SUMMARY_PROMPT},
-            {'role': 'user', 'content': f"Tytuł: {title}\n\nTreść:\n{content}"}
-        ])
-        return response['message']['content']
-    except Exception as e:
-        print(f"[!] Błąd AI: {e}")
-        return None
+    WYMAGANIA:
+    1. Podsumowanie musi mieć DOKŁADNIE 5 ZDAŃ.
+    2. Skup się tylko na kluczowych informacjach: co się stało, jakie jest zagrożenie, jak się chronić.
+    3. Jeśli artykuł jest o podatności (CVE), podaj numer CVE w jednym ze zdań.
+    4. Język polski, styl profesjonalny i konkretny.
+    """
 
-def save_news_note(title, url, summary, source_name):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    date_prefix = datetime.now().strftime("%Y-%m-%d")
-    
-    safe_title = clean_filename(title)[:50]
-    filename = f"{date_prefix}-news-{safe_title}.md"
-    filepath = os.path.join(NEWS_DIR, filename)
-    
-    note_content = f"""
----
+    def __init__(self, vault_path=None, model=None):
+        self.vault_path = vault_path if vault_path else str(ProjectConfig.OBSIDIAN_VAULT)
+        self.news_dir = os.path.join(self.vault_path, "Newsy")
+        self.history_file = os.path.join(ProjectConfig.BASE_DIR, "processed_news.json")
+        self.model = model if model else ProjectConfig.OLLAMA_MODEL
+        
+        # Helper for fetching content
+        self.researcher = WebResearcher(vault_path=self.vault_path)
+        
+        os.makedirs(self.news_dir, exist_ok=True)
+
+    def load_history(self) -> Set[str]:
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, "r") as f:
+                    return set(json.load(f))
+            except json.JSONDecodeError:
+                return set()
+        return set()
+
+    def save_history(self, history_set: Set[str]):
+        with open(self.history_file, "w") as f:
+            json.dump(list(history_set), f)
+
+    def analyze_article(self, url: str, title: str) -> str:
+        logger.info(f"Analyzing News: {title}")
+        
+        # Use WebResearcher to get content
+        _, content = self.researcher.fetch_article_content(url)
+        
+        if not content:
+            return None
+
+        # Limit content for speed (news usually needs less context)
+        content = content[:8000]
+
+        try:
+            response = ollama.chat(model=self.model, messages=[
+                {'role': 'system', 'content': self.SUMMARY_PROMPT},
+                {'role': 'user', 'content': f"Tytuł: {title}\n\nTreść:\n{content}"}
+            ])
+            return response['message']['content']
+        except Exception as e:
+            logger.error(f"AI Error: {e}")
+            return None
+
+    def save_news_note(self, title: str, url: str, summary: str, source_name: str):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        
+        safe_title = self.researcher.clean_filename(title)[:50]
+        filename = f"{date_prefix}-news-{safe_title}.md"
+        filepath = os.path.join(self.news_dir, filename)
+        
+        note_content = f"""
+--- 
 created: {timestamp}
 tags:
   - news
   - cybersec
-  - {clean_filename(source_name)}
+  - {self.researcher.clean_filename(source_name)}
 source: {url}
 ---
 
@@ -89,62 +109,53 @@ source: {url}
 ---
 *Auto-generated by News Agent*
 """
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(note_content)
+        logger.info(f"News saved: {filepath}")
+        return filepath
 
-    os.makedirs(NEWS_DIR, exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(note_content)
-    return filepath
+    def is_recent(self, entry, days=3):
+        if not hasattr(entry, 'published_parsed'):
+            return True 
+        published_time = datetime.fromtimestamp(mktime(entry.published_parsed))
+        threshold = datetime.now() - timedelta(days=days)
+        return published_time > threshold
 
-def is_recent(entry, days=DAYS_LOOKBACK):
-    """Sprawdza, czy artykuł jest nowszy niż X dni."""
-    if not hasattr(entry, 'published_parsed'):
-        return True # Jeśli brak daty, zakładamy, że jest świeży (bezpiecznik)
-    
-    published_time = datetime.fromtimestamp(mktime(entry.published_parsed))
-    threshold = datetime.now() - timedelta(days=days)
-    return published_time > threshold
-
-def run_news_automator(limit_per_feed=20):
-    """Uruchamia proces pobierania i analizy newsów."""
-    history = load_history()
-    new_articles_count = 0
-    
-    print(f"[*] Uruchamianie Agenta Newsowego (Ostatnie {DAYS_LOOKBACK} dni).")
-    
-    for name, url in RSS_FEEDS.items():
-        print(f"\n--- Sprawdzanie: {name} ---")
-        feed = feedparser.parse(url)
+    def run(self, limit_per_feed=5):
+        """Main execution loop."""
+        history = self.load_history()
+        new_articles_count = 0
         
-        # Sprawdzamy wpisy
-        for entry in feed.entries[:limit_per_feed]:
-            link = entry.link
-            title = entry.title
-            
-            # 1. Sprawdzenie daty
-            if not is_recent(entry):
-                # Jeśli wpis jest stary, to prawdopodobnie kolejne też będą stare (RSS jest chronologiczny),
-                # ale dla pewności po prostu go pomijamy.
-                continue
+        logger.info("Running News Agent...")
+        
+        for name, url in self.RSS_FEEDS.items():
+            logger.info(f"Checking: {name}")
+            try:
+                feed = feedparser.parse(url)
+                
+                for entry in feed.entries[:limit_per_feed]:
+                    link = entry.link
+                    title = entry.title
+                    
+                    if not self.is_recent(entry):
+                        continue
 
-            # 2. Sprawdzenie historii
-            if link in history:
-                print(f"[SKIP] Już przetworzono: {title}")
-                continue
-            
-            print(f"[NEW] Przetwarzanie: {title}")
-            summary = analyze_article(link, title)
-            
-            if summary:
-                save_news_note(title, link, summary, name)
-                history.add(link)
-                save_history(history) # Zapisujemy po każdym sukcesie
-                new_articles_count += 1
-                print(f"[OK] Zapisano notatkę.")
-            else:
-                print("[FAIL] Nie udało się wygenerować podsumowania.")
-    
-    return new_articles_count
+                    if link in history:
+                        continue
+                    
+                    summary = self.analyze_article(link, title)
+                    
+                    if summary:
+                        self.save_news_note(title, link, summary, name)
+                        history.add(link)
+                        self.save_history(history)
+                        new_articles_count += 1
+            except Exception as e:
+                logger.error(f"Feed Error ({name}): {e}")
+        
+        return new_articles_count
 
 if __name__ == "__main__":
-    count = run_news_automator()
-    print(f"\n[KONIEC] Przetworzono {count} nowych artykułów.")
+    agent = NewsAgent()
+    count = agent.run()
+    print(f"Processed {count} new articles.")

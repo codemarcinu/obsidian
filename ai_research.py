@@ -3,109 +3,124 @@ import argparse
 import requests
 from bs4 import BeautifulSoup
 import ollama
-from datetime import datetime
 import re
+import logging
+from datetime import datetime
 from tqdm import tqdm
+from typing import List, Tuple, Optional
 
-# --- KONFIGURACJA ---
-# Ścieżka do Twojego Obsidiana (zaktualizowana)
-OBSIDIAN_VAULT_PATH = "/mnt/c/Users/marci/Documents/Obsidian Vault/Education"
-OLLAMA_MODEL = "bielik"
+from config import ProjectConfig
 
-SYSTEM_PROMPT = """
-Jesteś analitykiem Cybersec/IT. Analizujesz treść artykułu technicznego lub dokumentacji.
-Twoim zadaniem jest stworzenie zwięzłej notatki (tl;dr) oraz wyciągnięcie technicznych szczegółów.
+logger = logging.getLogger("WebResearcher")
 
-ZASADY:
-1. Skup się na faktach, konfiguracjach, zagrożeniach i rozwiązaniach.
-2. JEŚLI WIDZISZ KOD, KOMENDY LUB JSON - zachowaj je w blokach kodu ```.
-3. Pomiń marketing, wstępy o autorze i stopki.
-4. Formatuj w Markdown.
-"""
-
-def clean_filename(title):
-    title = title.lower()
-    title = re.sub(r'[^\w\s-]', '', title)
-    return re.sub(r'[\s_-]+', '-', title).strip('-')
-
-def fetch_article_content(url):
-    print(f"[*] Pobieranie: {url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Usuwamy śmieci (skrypty, style, nawigację)
-        for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            script.extract()
-            
-        title = soup.title.string if soup.title else "Unknown Article"
-        
-        # Pobieramy tekst
-        text = soup.get_text(separator='\n')
-        
-        # Czyścimy puste linie
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = '\n'.join(chunk for chunk in chunks if chunk)
-        
-        return title, text
-    except Exception as e:
-        print(f"[!] Błąd pobierania: {e}")
-        return None, None
-
-def create_chunks(text, chunk_size=6000, overlap=500):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
-
-def process_url(url):
-    title, text = fetch_article_content(url)
+class WebResearcher:
+    """
+    Fetches and analyzes web articles using local AI.
+    """
     
-    if not text:
-        return
+    SYSTEM_PROMPT = """
+    Jesteś analitykiem Cybersec/IT. Analizujesz treść artykułu technicznego lub dokumentacji.
+    Twoim zadaniem jest stworzenie zwięzłej notatki (tl;dr) oraz wyciągnięcie technicznych szczegółów.
 
-    safe_title = clean_filename(title)[:60]
-    print(f"[*] Tytuł: {title}")
-    
-    # Jeśli tekst jest krótki (<6000 znaków), analizujemy na raz
-    if len(text) < 6000:
-        print("[*] Krótki artykuł - analiza jednoprzebiegowa...")
-        chunks = [text]
-    else:
-        print("[*] Długi artykuł - dzielenie na fragmenty...")
-        chunks = create_chunks(text)
+    ZASADY:
+    1. Skup się na faktach, konfiguracjach, zagrożeniach i rozwiązaniach.
+    2. JEŚLI WIDZISZ KOD, KOMENDY LUB JSON - zachowaj je w blokach kodu ```.
+    3. Pomiń marketing, wstępy o autorze i stopki.
+    4. Formatuj w Markdown.
+    """
 
-    full_notes = []
-    
-    for i, chunk in enumerate(tqdm(chunks, desc="Analiza AI", unit="part")):
+    def __init__(self, vault_path: Optional[str] = None, model: str = None):
+        self.vault_path = vault_path if vault_path else str(ProjectConfig.OBSIDIAN_VAULT)
+        self.model = model if model else ProjectConfig.OLLAMA_MODEL
+        
+        # Ensure 'Research' subdirectory exists
+        self.output_dir = os.path.join(self.vault_path, "Research")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    @staticmethod
+    def clean_filename(title: str) -> str:
+        title = title.lower()
+        title = re.sub(r'[^\w\s-]', '', title)
+        return re.sub(r'[\s_-]+', '-', title).strip('-')
+
+    def fetch_article_content(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        logger.info(f"Fetching: {url}")
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         try:
-            response = ollama.chat(model=OLLAMA_MODEL, messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': f"Przeanalizuj ten fragment i zrób notatkę:\n\n{chunk}"}
-            ])
-            note_part = response['message']['content']
-            full_notes.append(note_part)
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Remove garbage
+            for script in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "ad"]):
+                script.extract()
+                
+            title = soup.title.string if soup.title else "Unknown Article"
+            title = title.strip()
+            
+            # Extract text
+            text = soup.get_text(separator='\n')
+            
+            # Clean empty lines
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            clean_text = '\n'.join(chunk for chunk in chunks if chunk)
+            
+            return title, clean_text
         except Exception as e:
-            print(f"[!] Błąd AI: {e}")
+            logger.error(f"Download error for {url}: {e}")
+            return None, None
 
-    save_note(safe_title, url, full_notes)
+    def create_chunks(self, text: str, chunk_size: int = 6000, overlap: int = 500) -> List[str]:
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = start + chunk_size
+            chunks.append(text[start:end])
+            start += chunk_size - overlap
+        return chunks
 
-def save_note(title, url, notes_list):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    date_prefix = datetime.now().strftime("%Y-%m-%d")
-    filename = f"{date_prefix}-web-{title}.md"
-    filepath = os.path.join(OBSIDIAN_VAULT_PATH, filename)
-    
-    joined_notes = "\n\n".join(notes_list)
+    def process_url(self, url: str) -> bool:
+        title, text = self.fetch_article_content(url)
+        
+        if not text:
+            return False
 
-    content = f"""---
+        safe_title = self.clean_filename(title)[:60]
+        logger.info(f"Analyzing: {title}")
+        
+        if len(text) < 6000:
+            chunks = [text]
+        else:
+            chunks = self.create_chunks(text)
+
+        full_notes = []
+        
+        for i, chunk in enumerate(tqdm(chunks, desc="AI Analysis", unit="part")):
+            try:
+                response = ollama.chat(model=self.model, messages=[
+                    {'role': 'system', 'content': self.SYSTEM_PROMPT},
+                    {'role': 'user', 'content': f"Przeanalizuj ten fragment i zrób notatkę:\n\n{chunk}"}
+                ])
+                note_part = response['message']['content']
+                full_notes.append(note_part)
+            except Exception as e:
+                logger.error(f"AI Error: {e}")
+                full_notes.append(f"> [!ERROR] AI Analysis failed for chunk {i}")
+
+        return self.save_note(safe_title, title, url, full_notes)
+
+    def save_note(self, safe_title: str, original_title: str, url: str, notes_list: List[str]) -> bool:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{date_prefix}-web-{safe_title}.md"
+        filepath = os.path.join(self.output_dir, filename)
+        
+        joined_notes = "\n\n".join(notes_list)
+
+        content = f"""
+--- 
 created: {timestamp}
 tags:
   - research
@@ -115,7 +130,7 @@ source: {url}
 status: to-read
 ---
 
-# Research: {title}
+# Research: {original_title}
 
 > **Źródło:** [{url}]({url})
 
@@ -125,18 +140,22 @@ status: to-read
 {joined_notes}
 
 ---
-*Generated by Python & Ollama (bielik)*
+*Generated by WebResearcher (Refactored)*
 """
-    
-    os.makedirs(OBSIDIAN_VAULT_PATH, exist_ok=True)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    print(f"\n[SUCCESS] Notatka zapisana: {filepath}")
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+            logger.info(f"Note saved: {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Save error: {e}")
+            return False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI Web Researcher")
-    parser.add_argument("url", help="Adres URL do artykułu")
+    parser.add_argument("url", help="URL to analyze")
     args = parser.parse_args()
     
-    process_url(args.url)
+    researcher = WebResearcher()
+    researcher.process_url(args.url)
