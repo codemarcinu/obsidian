@@ -1,128 +1,114 @@
 import os
-import argparse
-import fitz  # PyMuPDF
-import ollama
-from tqdm import tqdm
-import re
+import logging
+import pdfplumber
+from typing import List, Dict, Optional, Tuple
+from pathlib import Path
+from datetime import datetime
 
-# --- KONFIGURACJA ---
-OBSIDIAN_VAULT_PATH = "/mnt/c/Users/marci/Documents/Obsidian Vault/Education"
-OLLAMA_MODEL = "bielik"
+from config import ProjectConfig, logger
+from obsidian_manager import ObsidianGardener
 
-SYSTEM_PROMPT = """
-Jesteś ekspertem Compliance/IT. Masz przed sobą fragment raportu/audytu.
-Twoim zadaniem jest wygenerowanie metadanych do notatki Obsidian.
+class PDFShredder:
+    """
+    Advanced PDF Processor: Extracts text and tables, detects compliance patterns,
+    and generates structured Obsidian notes.
+    """
 
-Zwróć TYLKO blok YAML frontmatter i jedno zdanie podsumowania.
-Format:
+    COMPLIANCE_MAP = {
+        "DORA": ["DORA", "ICT", "rezyliencja", "operacyjna", "incydent", "finansowe"],
+        "NIS2": ["NIS2", "dyrektywa", "cyberbezpieczeństwo", "bezpieczeństwo sieci", "podmiot kluczowy"],
+        "RODO": ["RODO", "GDPR", "dane osobowe", "przetwarzanie", "osób fizycznych", "poufność"]
+    }
+
+    def __init__(self, vault_path: Optional[str] = None):
+        self.vault_path = Path(vault_path) if vault_path else ProjectConfig.OBSIDIAN_VAULT
+        self.output_dir = self.vault_path / "Compliance"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger("PDFShredder")
+
+    def detect_compliance_tags(self, text: str) -> List[str]:
+        """Automated Compliance Tagging (Point 6 of Audit)."""
+        tags = []
+        text_lower = text.lower()
+        for tag, keywords in self.COMPLIANCE_MAP.items():
+            if any(kw.lower() in text_lower for kw in keywords):
+                tags.append(tag)
+        return tags if tags else ["General"]
+
+    def extract_content(self, pdf_path: str) -> Tuple[str, List[str]]:
+        """Extracts text and identifies compliance scope."""
+        full_text = []
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    # Extract text
+                    page_text = page.extract_text()
+                    if page_text:
+                        full_text.append(page_text)
+                    
+                    # Optional: Table extraction logic (simplified for MVP)
+                    tables = page.extract_tables()
+                    for table in tables:
+                        if table:
+                            full_text.append("| " + " | ".join([str(cell or "") for cell in table[0]]) + " |")
+                            full_text.append("|" + "---|" * len(table[0]))
+        except Exception as e:
+            self.logger.error(f"Error reading PDF {pdf_path}: {e}")
+            return "", []
+
+        combined_text = "\n".join(full_text)
+        tags = self.detect_compliance_tags(combined_text)
+        return combined_text, tags
+
+    def process_pdf(self, pdf_path: str) -> Tuple[bool, str]:
+        """Main pipeline for PDF ingestion."""
+        self.logger.info(f"Shredding PDF: {pdf_path}")
+        
+        content, tags = self.extract_content(pdf_path)
+        if not content:
+            return False, "Failed to extract content."
+
+        # Metadata generation
+        title = Path(pdf_path).stem
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+        
+        # Save structured note
+        final_path = self.save_as_note(safe_title, content, tags)
+        
+        # Auto-linking via Gardener
+        gardener = ObsidianGardener(str(self.vault_path))
+        gardener.process_file(final_path)
+        
+        return True, str(final_path)
+
+    def save_as_note(self, title: str, content: str, tags: List[str]) -> Path:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        filepath = self.output_dir / f"PDF-{title}.md"
+        
+        tag_string = "\n  - ".join(tags)
+        
+        note_content = f"""
 ---
-tags: [tag1, tag2]
-risk_level: high/medium/low
+created: {timestamp}
+tags:
+  - {tag_string}
+  - pdf-shredder
+type: audit-document
+status: processed
 ---
-# Podsumowanie
-[Jedno zdanie o czym to jest]
+
+# {title}
+
+> [!INFO] Dokument przeanalizowany przez PDF Shredder (Refactored v2.0)
+> Wykryte obszary zgodności: {', '.join(tags)}
+
+## Treść Wyciągnięta
+
+{content[:20000]} # Limit to 20k chars for Obsidian performance
+
+---
+*End of document extract.*
 """
-
-def clean_filename(text):
-    text = text.lower()
-    text = re.sub(r'[^\w\s-]', '', text)
-    return re.sub(r'[\s_-]+', '-', text).strip('-')[:50]
-
-def extract_chapters_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    chapters = []
-    
-    current_chapter_title = "Wstęp"
-    current_text = []
-    
-    print(f"[*] Analiza struktury PDF: {pdf_path}")
-    
-    # Prosta heurystyka: czytamy strona po stronie
-    # W wersji PRO można by analizować rozmiar czcionki (font size) żeby wykrywać nagłówki
-    for page_num, page in enumerate(doc):
-        text = page.get_text()
-        
-        # Szukamy potencjalnych nagłówków (np. "Rozdział 1", "2. Metodologia")
-        # To jest uproszczone - w prawdziwym życiu PDFy to piekło formatowania
-        lines = text.split('\n')
-        for line in lines:
-            # Jeśli linia wygląda na nagłówek (krótka, zaczyna się od cyfry lub słowa kluczowego)
-            if len(line) < 50 and (re.match(r'^\d+\.', line) or "Rozdział" in line or "Sekcja" in line):
-                # Zapisz poprzedni rozdział
-                if current_text:
-                    chapters.append({
-                        "title": current_chapter_title,
-                        "content": "\n".join(current_text)
-                    })
-                
-                current_chapter_title = line.strip()
-                current_text = []
-            else:
-                current_text.append(line)
-                
-    # Dodaj ostatni rozdział
-    if current_text:
-        chapters.append({"title": current_chapter_title, "content": "\n".join(current_text)})
-        
-    return chapters
-
-def process_chapter_with_ai(text):
-    # Skracamy tekst jeśli za długi dla modelu
-    sample = text[:4000] 
-    
-    try:
-        response = ollama.chat(model=OLLAMA_MODEL, messages=[
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': f"Oto fragment tekstu:\n{sample}"}
-        ])
-        return response['message']['content']
-    except:
-        return "---\ntags: [auto-generated]\n---\n# Podsumowanie\nBłąd analizy AI."
-
-def shred_pdf(pdf_path):
-    pdf_name = os.path.basename(pdf_path).replace('.pdf', '')
-    safe_pdf_name = clean_filename(pdf_name)
-    
-    # Tworzymy folder na ten konkretny raport w Obsidianie
-    output_dir = os.path.join(OBSIDIAN_VAULT_PATH, safe_pdf_name)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    chapters = extract_chapters_from_pdf(pdf_path)
-    print(f"[*] Znaleziono {len(chapters)} sekcji. Przetwarzanie...")
-
-    # Plik główny (MOC - Map of Content)
-    moc_content = [f"# Raport: {pdf_name}\n\n## Spis treści"]
-    
-    for i, chapter in enumerate(tqdm(chapters)):
-        # Jeśli sekcja jest pusta/za krótka, pomijamy
-        if len(chapter['content']) < 100:
-            continue
-            
-        safe_title = f"{i+1:02d}-{clean_filename(chapter['title'])}"
-        filename = f"{safe_title}.md"
-        
-        # Analiza AI
-        ai_metadata = process_chapter_with_ai(chapter['content'])
-        
-        # Składanie notatki
-        full_note = f"{ai_metadata}\n\n## Treść\n{chapter['content']}\n\n---\n[[00-MOC-{safe_pdf_name}|Wróć do spisu treści]]"
-        
-        with open(os.path.join(output_dir, filename), 'w', encoding='utf-8') as f:
-            f.write(full_note)
-            
-        # Dodaj do MOC
-        moc_content.append(f"- [[{safe_title}|{chapter['title']}]]")
-
-    # Zapisz MOC
-    moc_filename = f"00-MOC-{safe_pdf_name}.md"
-    with open(os.path.join(output_dir, moc_filename), 'w', encoding='utf-8') as f:
-        f.write("\n".join(moc_content))
-
-    print(f"\n[SUCCESS] Raport pocięty! Sprawdź folder: {output_dir}")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PDF Shredder for Obsidian")
-    parser.add_argument("pdf", help="Ścieżka do pliku PDF")
-    args = parser.parse_args()
-    
-    shred_pdf(args.pdf)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(note_content)
+        return filepath

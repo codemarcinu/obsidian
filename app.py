@@ -4,12 +4,13 @@ import shutil
 from pathlib import Path
 
 # Imports
-from config import ProjectConfig
+from config import ProjectConfig, logger
 from ai_notes import TranscriptProcessor
 from rag_engine import ObsidianRAG
 from video_transcriber import VideoTranscriber
 from news_agent import NewsAgent
 from ai_research import WebResearcher
+from pdf_shredder import PDFShredder
 
 # --- CONFIG & INIT ---
 st.set_page_config(page_title="Obsidian AI Bridge v2", layout="wide", page_icon="🧠")
@@ -31,6 +32,7 @@ with st.sidebar:
         [
             "📥 Import: Wideo/Audio",
             "🌐 Research & News",
+            "📄 Import: PDF Compliance",
             "🏭 Inbox (Przetwarzanie)",
             "🔎 RAG Chat (Baza Wiedzy)",
             "⚙️ Ustawienia"
@@ -61,19 +63,19 @@ if mode == "📥 Import: Wideo/Audio":
     with col2:
         model_size = st.selectbox("Model Whisper", ["base", "small", "medium", "large-v3"], index=1)
         do_obsidian = st.checkbox("Auto-Notatka (Obsidian)", value=True)
+        keep_files = st.checkbox("Zachowaj pliki źródłowe (Debug)", value=False)
 
     if st.button("🚀 Uruchom Proces", type="primary"):
         status_container = st.container()
         p_bar = status_container.progress(0)
         s_text = status_container.empty()
         
+        target_file = None
         try:
             transcriber = VideoTranscriber(
                 log_callback=lambda x: None, 
                 progress_callback=get_transcriber_callback(p_bar, s_text)
             )
-            
-            target_file = None
             
             # 1. Acquire Media
             if video_url:
@@ -126,6 +128,12 @@ if mode == "📥 Import: Wideo/Audio":
 
         except Exception as e:
             st.error(f"Critical Error: {e}")
+            logger.error(f"Ingestion failed: {e}", exc_info=True)
+        finally:
+            # 4. Cleanup
+            if target_file and os.path.exists(target_file) and not keep_files:
+                os.remove(target_file)
+                logger.info(f"Cleaned up temp file: {target_file}")
 
 # 2. RESEARCH & NEWS
 elif mode == "🌐 Research & News":
@@ -156,7 +164,32 @@ elif mode == "🌐 Research & News":
             if count > 0:
                 st.balloons()
 
-# 3. INBOX PROCESSING
+# 3. PDF COMPLIANCE
+elif mode == "📄 Import: PDF Compliance":
+    st.header("📄 PDF Shredder (DORA/NIS2)")
+    st.caption("Automatyczna ekstrakcja tabel i tagowanie regulacyjne.")
+    
+    uploaded_pdf = st.file_uploader("Wgraj dokument (PDF):", type="pdf")
+    if uploaded_pdf and st.button("Analizuj Dokument"):
+        temp_path = ProjectConfig.TEMP_DIR / uploaded_pdf.name
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_pdf.getbuffer())
+        
+        with st.spinner("Przetwarzanie strukturalne..."):
+            shredder = PDFShredder()
+            success, msg = shredder.process_pdf(str(temp_path))
+            
+            if success:
+                st.success(f"Raport wygenerowany: {Path(msg).name}")
+                st.info("Dokument został automatycznie zlinkowany z Bazą Wiedzy.")
+            else:
+                st.error(f"Błąd: {msg}")
+        
+        # Cleanup
+        if temp_path.exists():
+            temp_path.unlink()
+
+# 4. INBOX PROCESSING
 elif mode == "🏭 Inbox (Przetwarzanie)":
     st.header("🏭 Fabryka Wiedzy (Inbox)")
     
@@ -188,7 +221,7 @@ elif mode == "🏭 Inbox (Przetwarzanie)":
                         else:
                             st.error(f"Błąd: {msg}")
 
-# 4. RAG CHAT
+# 5. RAG CHAT
 elif mode == "🔎 RAG Chat (Baza Wiedzy)":
     st.header("🔎 Rozmowa z Bazą Wiedzy")
     
@@ -231,7 +264,7 @@ elif mode == "🔎 RAG Chat (Baza Wiedzy)":
             response_placeholder.markdown(full_response)
             st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-# 5. SETTINGS
+# 6. SETTINGS
 elif mode == "⚙️ Ustawienia":
     st.header("Konfiguracja")
     st.code(f"""

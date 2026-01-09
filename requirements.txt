@@ -1,16 +1,13 @@
-streamlit
-chromadb
-langchain-community
-langchain-ollama
-sentence-transformers
-pypdf
-pytube
-openai-whisper
-python-dotenv
-# Nowe zależności dla Refaktoryzacji:
-rapidfuzz==3.6.1       # Dla Punktu 5: Obsidian Linking (Fuzzy match)
-pdfplumber==0.10.3     # Dla Punktu 6: Lepsza ekstrakcja tabel z PDF
-watchdog==3.0.0        # Dla Punktu 2: Incremental Indexing (monitoring plików)
-pyannote.audio         # Dla Diaryzacji mówców
-faster-whisper         # Szybszy Whisper
-yt-dlp                 # Pobieranie z YT
+streamlit==1.31.0
+chromadb==0.4.22
+langchain-community==0.0.19
+langchain-ollama==0.0.1
+sentence-transformers==2.3.1
+pdfplumber==0.10.3
+yt-dlp==2023.12.30
+openai-whisper==20231117
+faster-whisper==0.10.0
+rapidfuzz==3.6.1
+pyannote.audio==3.1.1
+python-dotenv==1.0.1
+watchdog==3.0.0

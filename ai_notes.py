@@ -91,6 +91,15 @@ class TranscriptProcessor:
             self.logger.error(f"Error generating metadata: {e}")
             return "Szkolenie Cybersec AutoNote", "Automatycznie wygenerowana notatka."
 
+    def detect_compliance(self, text: str) -> List[str]:
+        """Helper to identify DORA/RODO/NIS2 contexts in transcripts."""
+        found = []
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in ["rodo", "gdpr", "osobowe"]): found.append("RODO")
+        if any(kw in text_lower for kw in ["dora", "rezyliencja", "ict"]): found.append("DORA")
+        if any(kw in text_lower for kw in ["nis2", "dyrektywa", "cyberbezpieczeństwo"]): found.append("NIS2")
+        return found if found else ["TBC"]
+
     def process_transcript(self, file_path: str) -> Tuple[bool, str]:
         """
         Main logic to process a transcript file.
@@ -149,15 +158,18 @@ class TranscriptProcessor:
         filename = f"{date_prefix}-{title}.md"
         filepath = os.path.join(self.vault_path, filename)
         
+        all_text = " ".join(notes_list)
+        compliance_tags = self.detect_compliance(all_text)
+        
         content = f"""
---- 
+---
 created: {timestamp}
 tags:
   - auto-generated
   - education
   - transcript
 status: to-review
-compliance: [TODO]
+compliance: {compliance_tags}
 ---
 
 # {title}
