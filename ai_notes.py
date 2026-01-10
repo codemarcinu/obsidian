@@ -29,14 +29,16 @@ class TranscriptProcessor:
 
     def __init__(self, model: Optional[str] = None):
         self.model = model or ProjectConfig.OLLAMA_MODEL
+        self.fast_model = ProjectConfig.OLLAMA_MODEL_FAST
         self.logger = logging.getLogger("TranscriptProcessor")
 
     def _generate_metadata(self, text: str) -> Tuple[str, str]:
-        """Uses LLM to generate title and short summary."""
+        """Uses lightweight LLM (Fast Model) to generate title and short summary."""
         prompt = "Na podstawie tekstu podaj: 1. Krótki tytuł techniczny (bez znaków specjalnych), 2. Jednozdaniowe podsumowanie."
         try:
+            # Use faster, smaller model for metadata generation to save time/compute
             resp = ollama.chat(
-                model=self.model,
+                model=self.fast_model,
                 messages=[{'role': 'user', 'content': f"{prompt}\n\nTekst: {text[:2000]}"}]
             )
             content = resp['message']['content']

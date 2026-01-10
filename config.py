@@ -20,7 +20,10 @@ class Settings(BaseSettings):
 
     # LLM Settings (Ollama)
     OLLAMA_URL: str = Field(default="http://localhost:11434")
-    OLLAMA_MODEL: str = Field(default="bielik:latest")
+    # Main "Brain" Model (High Intelligence, Polish Context) - Optimized for RTX 3060 (12GB)
+    OLLAMA_MODEL: str = Field(default="SpeakLeash/bielik-11b-v2.3-instruct:Q5_K_M")
+    # Fast "Worker" Model (Tagging, Metadata, Simple JSON) - Low VRAM usage
+    OLLAMA_MODEL_FAST: str = Field(default="llama3.2:latest")
     
     # External APIs
     HF_TOKEN: Optional[str] = None

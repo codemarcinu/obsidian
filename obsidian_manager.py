@@ -106,7 +106,7 @@ class ObsidianGardener:
             new_content = self.optimizer.process_text(content)
             
             # 2. Semantic Linking (Smart - Optional/Slower)
-            # new_content = self.suggest_semantic_links(new_content) # Uncomment to enable RAG linking
+            new_content = self.suggest_semantic_links(new_content) 
 
             if new_content != content:
                 path.write_text(new_content, encoding='utf-8')
