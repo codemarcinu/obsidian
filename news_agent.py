@@ -5,157 +5,105 @@ import ollama
 import logging
 from datetime import datetime, timedelta
 from time import mktime
-from typing import Set
+from typing import Set, Optional
+from pathlib import Path
 
-from config import ProjectConfig
+from config import ProjectConfig, logger
 from ai_research import WebResearcher
-
-logger = logging.getLogger("NewsAgent")
+from obsidian_manager import ObsidianGardener
 
 class NewsAgent:
     """
-    Automates fetching and summarizing cybersec news from RSS feeds.
+    Automates fetching and summarizing cybersec news.
+    Now with integrated Obsidian linking and DORA tagging.
     """
     
     RSS_FEEDS = {
         "Sekurak": "https://feeds.feedburner.com/sekurak",
         "Niebezpiecznik": "https://feeds.feedburner.com/niebezpiecznik",
-        "Zaufana Trzecia Strona": "https://zaufanatrzeciastrona.pl/feed/",
-        # "ZTS - Weekendowa": "https://zaufanatrzeciastrona.pl/tag/weekendowa-lektura/feed/"
+        "Zaufana Trzecia Strona": "https://zaufanatrzeciastrona.pl/feed/"
     }
 
-    SUMMARY_PROMPT = """
-    Jesteś ekspertem cyberbezpieczeństwa. Twoim zadaniem jest przeczytanie artykułu i stworzenie SKONDENSOWANEGO podsumowania.
+    def __init__(self):
+        self.news_dir = ProjectConfig.OBSIDIAN_VAULT / "Newsy"
+        self.news_dir.mkdir(parents=True, exist_ok=True)
+        self.history_file = ProjectConfig.BASE_DIR / "processed_news.json"
+        self.model = ProjectConfig.OLLAMA_MODEL
+        self.researcher = WebResearcher()
 
-    WYMAGANIA:
-    1. Podsumowanie musi mieć DOKŁADNIE 5 ZDAŃ.
-    2. Skup się tylko na kluczowych informacjach: co się stało, jakie jest zagrożenie, jak się chronić.
-    3. Jeśli artykuł jest o podatności (CVE), podaj numer CVE w jednym ze zdań.
-    4. Język polski, styl profesjonalny i konkretny.
-    """
-
-    def __init__(self, vault_path=None, model=None):
-        self.vault_path = vault_path if vault_path else str(ProjectConfig.OBSIDIAN_VAULT)
-        self.news_dir = os.path.join(self.vault_path, "Newsy")
-        self.history_file = os.path.join(ProjectConfig.BASE_DIR, "processed_news.json")
-        self.model = model if model else ProjectConfig.OLLAMA_MODEL
-        
-        # Helper for fetching content
-        self.researcher = WebResearcher(vault_path=self.vault_path)
-        
-        os.makedirs(self.news_dir, exist_ok=True)
-
-    def load_history(self) -> Set[str]:
-        if os.path.exists(self.history_file):
+    def _load_history(self) -> Set[str]:
+        if self.history_file.exists():
             try:
-                with open(self.history_file, "r") as f:
-                    return set(json.load(f))
-            except json.JSONDecodeError:
+                return set(json.loads(self.history_file.read_text()))
+            except:
                 return set()
         return set()
 
-    def save_history(self, history_set: Set[str]):
-        with open(self.history_file, "w") as f:
-            json.dump(list(history_set), f)
+    def _save_history(self, history: Set[str]):
+        self.history_file.write_text(json.dumps(list(history)))
 
-    def analyze_article(self, url: str, title: str) -> str:
-        logger.info(f"Analyzing News: {title}")
+    def run(self, limit: int = 5) -> int:
+        history = self._load_history()
+        count = 0
         
-        # Use WebResearcher to get content
+        for source, url in self.RSS_FEEDS.items():
+            logger.info(f"Checking feed: {source}", extra={"tags": "NEWS-SYNC"})
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:limit]:
+                    if entry.link in history: continue
+                    
+                    # Basic analysis
+                    summary = self._analyze(entry.link, entry.title)
+                    if summary:
+                        path = self._save_note(entry.title, entry.link, summary, source)
+                        history.add(entry.link)
+                        count += 1
+            except Exception as e:
+                logger.error(f"Feed error ({source}): {e}")
+        
+        self._save_history(history)
+        return count
+
+    def _analyze(self, url: str, title: str) -> Optional[str]:
         _, content = self.researcher.fetch_article_content(url)
-        
-        if not content:
-            return None
+        if not content: return None
 
-        # Limit content for speed (news usually needs less context)
-        content = content[:8000]
-
+        prompt = "Jesteś analitykiem cybersec. Podsumuj ten news w 5 konkretnych zdaniach technicznych."
         try:
-            response = ollama.chat(model=self.model, messages=[
-                {'role': 'system', 'content': self.SUMMARY_PROMPT},
-                {'role': 'user', 'content': f"Tytuł: {title}\n\nTreść:\n{content}"}
+            resp = ollama.chat(model=self.model, messages=[
+                {'role': 'system', 'content': prompt},
+                {'role': 'user', 'content': f"Tytuł: {title}\n\nTreść: {content[:8000]}"}
             ])
-            return response['message']['content']
-        except Exception as e:
-            logger.error(f"AI Error: {e}")
+            return resp['message']['content']
+        except Exception:
             return None
 
-    def save_news_note(self, title: str, url: str, summary: str, source_name: str):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        date_prefix = datetime.now().strftime("%Y-%m-%d")
-        
+    def _save_note(self, title: str, url: str, summary: str, source: str) -> Path:
+        date_str = datetime.now().strftime("%Y-%m-%d")
         safe_title = self.researcher.clean_filename(title)[:50]
-        filename = f"{date_prefix}-news-{safe_title}.md"
-        filepath = os.path.join(self.news_dir, filename)
+        filename = f"{date_str}-news-{safe_title}.md"
+        path = self.news_dir / filename
         
-        note_content = f"""
---- 
-created: {timestamp}
-tags:
-  - news
-  - cybersec
-  - {self.researcher.clean_filename(source_name)}
+        content = f"""
+---
+created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
+tags: [news, cybersec, {source.lower()}]
 source: {url}
 ---
 
 # {title}
 
-**Źródło:** {source_name} | [Oryginał]({url})
+**Source:** {source} | [Original]({url})
 
-## Podsumowanie AI (5 zdań)
-
+## Podsumowanie AI
 {summary}
 
 ---
-*Auto-generated by News Agent*
-"""
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(note_content)
-        logger.info(f"News saved: {filepath}")
-        return filepath
-
-    def is_recent(self, entry, days=3):
-        if not hasattr(entry, 'published_parsed'):
-            return True 
-        published_time = datetime.fromtimestamp(mktime(entry.published_parsed))
-        threshold = datetime.now() - timedelta(days=days)
-        return published_time > threshold
-
-    def run(self, limit_per_feed=5):
-        """Main execution loop."""
-        history = self.load_history()
-        new_articles_count = 0
+*Generated by NewsAgent*"""
+        path.write_text(content, encoding='utf-8')
         
-        logger.info("Running News Agent...")
-        
-        for name, url in self.RSS_FEEDS.items():
-            logger.info(f"Checking: {name}")
-            try:
-                feed = feedparser.parse(url)
-                
-                for entry in feed.entries[:limit_per_feed]:
-                    link = entry.link
-                    title = entry.title
-                    
-                    if not self.is_recent(entry):
-                        continue
-
-                    if link in history:
-                        continue
-                    
-                    summary = self.analyze_article(link, title)
-                    
-                    if summary:
-                        self.save_news_note(title, link, summary, name)
-                        history.add(link)
-                        self.save_history(history)
-                        new_articles_count += 1
-            except Exception as e:
-                logger.error(f"Feed Error ({name}): {e}")
-        
-        return new_articles_count
-
-if __name__ == "__main__":
-    agent = NewsAgent()
-    count = agent.run()
-    print(f"Processed {count} new articles.")
+        # Link concepts
+        gardener = ObsidianGardener()
+        gardener.process_file(str(path))
+        return path

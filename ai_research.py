@@ -8,14 +8,15 @@ import logging
 from datetime import datetime
 from tqdm import tqdm
 from typing import List, Tuple, Optional
+from pathlib import Path
 
-from config import ProjectConfig
-
-logger = logging.getLogger("WebResearcher")
+from config import ProjectConfig, logger
+from obsidian_manager import ObsidianGardener
 
 class WebResearcher:
     """
     Fetches and analyzes web articles using local AI.
+    Integrated with ProjectConfig and ObsidianGardener.
     """
     
     SYSTEM_PROMPT = """
@@ -23,19 +24,16 @@ class WebResearcher:
     Twoim zadaniem jest stworzenie zwięzłej notatki (tl;dr) oraz wyciągnięcie technicznych szczegółów.
 
     ZASADY:
-    1. Skup się na faktach, konfiguracjach, zagrożeniach i rozwiązaniach.
-    2. JEŚLI WIDZISZ KOD, KOMENDY LUB JSON - zachowaj je w blokach kodu ```.
-    3. Pomiń marketing, wstępy o autorze i stopki.
-    4. Formatuj w Markdown.
+    1. Skup się na faktach, konfiguracjach i kodzie.
+    2. Formatuj w Markdown.
+    3. Pomiń zbędne informacje (reklamy, wstępy).
     """
 
-    def __init__(self, vault_path: Optional[str] = None, model: str = None):
-        self.vault_path = vault_path if vault_path else str(ProjectConfig.OBSIDIAN_VAULT)
-        self.model = model if model else ProjectConfig.OLLAMA_MODEL
-        
-        # Ensure 'Research' subdirectory exists
-        self.output_dir = os.path.join(self.vault_path, "Research")
-        os.makedirs(self.output_dir, exist_ok=True)
+    def __init__(self, model: Optional[str] = None):
+        self.vault_path = ProjectConfig.OBSIDIAN_VAULT
+        self.model = model or ProjectConfig.OLLAMA_MODEL
+        self.output_dir = self.vault_path / "Research"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def clean_filename(title: str) -> str:
@@ -44,95 +42,65 @@ class WebResearcher:
         return re.sub(r'[\s_-]+', '-', title).strip('-')
 
     def fetch_article_content(self, url: str) -> Tuple[Optional[str], Optional[str]]:
-        logger.info(f"Fetching: {url}")
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        logger.info(f"Fetching: {url}", extra={"tags": "WEB-RESEARCH"})
+        headers = {'User-Agent': 'Mozilla/5.0 (Gemini CLI Bridge)'}
         try:
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
-            
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Remove garbage
-            for script in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "ad"]):
+            for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 script.extract()
                 
-            title = soup.title.string if soup.title else "Unknown Article"
-            title = title.strip()
-            
-            # Extract text
+            title = soup.title.string.strip() if soup.title else "Unknown Article"
             text = soup.get_text(separator='\n')
             
-            # Clean empty lines
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            clean_text = '\n'.join(chunk for chunk in chunks if chunk)
-            
+            clean_text = '\n'.join(line.strip() for line in text.splitlines() if line.strip())
             return title, clean_text
         except Exception as e:
-            logger.error(f"Download error for {url}: {e}")
+            logger.error(f"Download error: {e}", extra={"tags": "WEB-ERROR"})
             return None, None
-
-    def create_chunks(self, text: str, chunk_size: int = 6000, overlap: int = 500) -> List[str]:
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            chunks.append(text[start:end])
-            start += chunk_size - overlap
-        return chunks
 
     def process_url(self, url: str) -> bool:
         title, text = self.fetch_article_content(url)
-        
-        if not text:
-            return False
+        if not text: return False
 
         safe_title = self.clean_filename(title)[:60]
-        logger.info(f"Analyzing: {title}")
         
-        if len(text) < 6000:
-            chunks = [text]
-        else:
-            chunks = self.create_chunks(text)
-
+        # Split into chunks if necessary
+        chunks = [text[i:i+6000] for i in range(0, len(text), 5500)]
         full_notes = []
         
-        for i, chunk in enumerate(tqdm(chunks, desc="AI Analysis", unit="part")):
+        for i, chunk in enumerate(tqdm(chunks, desc="AI Analysis")):
             try:
-                response = ollama.chat(model=self.model, messages=[
+                resp = ollama.chat(model=self.model, messages=[
                     {'role': 'system', 'content': self.SYSTEM_PROMPT},
-                    {'role': 'user', 'content': f"Przeanalizuj ten fragment i zrób notatkę:\n\n{chunk}"}
+                    {'role': 'user', 'content': f"Fragment {i+1}:\n{chunk}"}
                 ])
-                note_part = response['message']['content']
-                full_notes.append(note_part)
+                full_notes.append(resp['message']['content'])
             except Exception as e:
                 logger.error(f"AI Error: {e}")
-                full_notes.append(f"> [!ERROR] AI Analysis failed for chunk {i}")
 
         return self.save_note(safe_title, title, url, full_notes)
 
     def save_note(self, safe_title: str, original_title: str, url: str, notes_list: List[str]) -> bool:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        date_prefix = datetime.now().strftime("%Y-%m-%d")
-        filename = f"{date_prefix}-web-{safe_title}.md"
-        filepath = os.path.join(self.output_dir, filename)
+        filename = f"{datetime.now().strftime('%Y-%m-%d')}-web-{safe_title}.md"
+        filepath = self.output_dir / filename
         
         joined_notes = "\n\n".join(notes_list)
 
         content = f"""
---- 
+---
 created: {timestamp}
-tags:
-  - research
-  - web
-  - ai-generated
+tags: [research, web, ai-generated]
 source: {url}
 status: to-read
 ---
 
 # Research: {original_title}
 
-> **Źródło:** [{url}]({url})
+> **Source:** [{url}]({url})
 
 ---
 ## Analiza AI
@@ -140,22 +108,12 @@ status: to-read
 {joined_notes}
 
 ---
-*Generated by WebResearcher (Refactored)*
+*Generated by WebResearcher (Architect Edition)*
 """
+        filepath.write_text(content, encoding='utf-8')
+        logger.info(f"Research saved: {filepath}", extra={"tags": "NOTE-SAVE"})
         
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(content)
-            logger.info(f"Note saved: {filepath}")
-            return True
-        except Exception as e:
-            logger.error(f"Save error: {e}")
-            return False
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Web Researcher")
-    parser.add_argument("url", help="URL to analyze")
-    args = parser.parse_args()
-    
-    researcher = WebResearcher()
-    researcher.process_url(args.url)
+        # Auto-link concepts
+        gardener = ObsidianGardener()
+        gardener.process_file(str(filepath))
+        return True

@@ -6,30 +6,65 @@ import warnings
 from typing import List, Dict, Optional, Any
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from config import ProjectConfig
 
-# Wyciszenie specyficznych warningów
+from config import ProjectConfig, logger
+
+# Silence annoying warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 class VideoTranscriber:
-    def __init__(self, model_size: str = "medium", log_callback=None, progress_callback=None):
+    """
+    Advanced Media Transcription & Diarization Pipeline.
+    Architecture: Singleton-ready. Models are loaded on init to persist in VRAM.
+    """
+
+    def __init__(self, model_size: str = "medium"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
         self.logger = logging.getLogger("VideoTranscriber")
-        self.log_callback = log_callback
-        self.progress_callback = progress_callback
         
-        self.logger.info(f"VideoTranscriber initialized on {self.device} ({self.compute_type})")
+        self.logger.info(
+            f"Initializing VideoTranscriber on {self.device} ({self.compute_type})...", 
+            extra={"tags": "MEDIA-INIT"}
+        )
+        
+        # 1. Load Whisper Model ONCE
+        try:
+            self.whisper_model = WhisperModel(
+                model_size, 
+                device=self.device, 
+                compute_type=self.compute_type
+            )
+            self.logger.info(f"Whisper ({model_size}) loaded into VRAM.", extra={"tags": "MODEL-LOAD"})
+        except Exception as e:
+            self.logger.error(f"Failed to load Whisper: {e}", extra={"tags": "FATAL"})
+            raise e
 
-    def download_video(self, url: str, save_path: str = None) -> str:
-        """
-        Downloads video/audio from YouTube using yt-dlp with SAFE filenames.
-        """
-        output_dir = save_path if save_path else str(ProjectConfig.TEMP_DIR)
-        
-        # Używamy ID wideo jako nazwy pliku, aby uniknąć problemów ze znakami specjalnymi w tytułach
-        # %(id)s.%(ext)s gwarantuje unikalność i brak spacji.
+        # 2. Pre-load Diarization Pipeline (Lazy loading optional, but strictly typed here)
+        self.diarization_pipeline = None
+        if ProjectConfig.HF_TOKEN:
+            try:
+                self.diarization_pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=ProjectConfig.HF_TOKEN
+                ).to(torch.device(self.device))
+                self.logger.info("Pyannote pipeline loaded.", extra={"tags": "MODEL-LOAD"})
+            except Exception as e:
+                self.logger.warning(f"Failed to load Pyannote: {e}. Diarization disabled.", extra={"tags": "COMPLIANCE-WARN"})
+        else:
+            self.logger.warning("No HF_TOKEN found. Diarization disabled.", extra={"tags": "CONFIG-INFO"})
+
+    def download_video(self, url: str, progress_callback=None) -> str:
+        """Downloads audio from various sources using yt-dlp."""
+        output_dir = str(ProjectConfig.TEMP_DIR)
         out_template = os.path.join(output_dir, '%(id)s.%(ext)s')
+
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                if progress_callback:
+                    percent = d.get('_percent_str', 'N/A')
+                    eta = d.get('_eta_str', 'N/A')
+                    progress_callback(f"Pobieranie: {percent} | ETA: {eta}")
 
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -41,112 +76,77 @@ class VideoTranscriber:
             }],
             'quiet': True,
             'no_warnings': True,
-            'restrictfilenames': True, # Dodatkowe zabezpieczenie nazwy
+            'restrictfilenames': True,
+            'nocheckcertificate': True,
+            'ignoreerrors': False,
+            'logtostderr': False,
+            'progress_hooks': [progress_hook],
+            'default_search': 'auto',
+            'source_address': '0.0.0.0',
+            # Imitate a real browser to avoid 403
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                if self.log_callback: self.log_callback("Pobieranie metadanych...")
-                info_dict = ydl.extract_info(url, download=True)
-                
-                # Pobierz rzeczywistą nazwę pliku po post-processingu (zamiana na mp3)
-                video_id = info_dict.get('id', 'video')
-                # yt-dlp z automatu zmienia rozszerzenie na mp3 po konwersji
-                final_filename = f"{video_id}.mp3"
-                final_path = os.path.join(output_dir, final_filename)
-                
-                self.logger.info(f"Downloaded audio to: {final_path}")
-                
-                # Zwracamy też tytuł, może się przydać w metadanych (opcjonalnie można go zwrócić jako tuple)
-                # Na potrzeby interfejsu zwracamy ścieżkę.
+                info = ydl.extract_info(url, download=True)
+                final_path = os.path.join(output_dir, f"{info['id']}.mp3")
+                self.logger.info(f"Downloaded media: {final_path}", extra={"tags": "MEDIA-DOWNLOAD"})
                 return final_path
-
         except Exception as e:
-            self.logger.error(f"Download failed: {e}")
-            raise e
+            self.logger.error(f"Download failed: {e}", extra={"tags": "MEDIA-ERROR"})
+            raise
 
-    def transcribe_and_diarize(self, audio_path: str, language: str = "pl", 
-                             model_size: str = "medium", use_diarization: bool = True) -> List[Dict[str, Any]]:
+    def transcribe_and_diarize(self, audio_path: str, language: str = "pl", progress_callback=None) -> List[Dict[str, Any]]:
         """
-        Runs Whisper for transcription and Pyannote for speaker diarization.
+        Full Pipeline using pre-loaded models.
         """
-        if self.progress_callback: self.progress_callback(10, "Ładowanie modelu Whisper...")
-        
         try:
-            # 1. Transcribe
-            model = WhisperModel(model_size, device=self.device, compute_type=self.compute_type)
-            segments, info = model.transcribe(audio_path, language=language, vad_filter=True)
+            # 1. Transcribe (Reuse self.whisper_model)
+            self.logger.info(f"Starting transcription...", extra={"tags": "WHISPER"})
+            segments, info = self.whisper_model.transcribe(audio_path, language=language, vad_filter=True)
             
             transcript_segments = []
-            if self.progress_callback: self.progress_callback(30, "Transkrypcja w toku...")
+            total_duration = info.duration
             
-            # Konwersja generatora na listę, aby móc wielokrotnie iterować
+            # Whisper generator must be consumed
             for segment in segments:
                 transcript_segments.append({
                     "start": segment.start,
                     "end": segment.end,
                     "text": segment.text.strip()
                 })
+                if progress_callback and total_duration > 0:
+                    percent = int((segment.end / total_duration) * 100)
+                    progress_callback(percent)
 
-            if not use_diarization:
+            if not self.diarization_pipeline:
                 return transcript_segments
 
-            # 2. Diarization (Optional but recommended)
-            # Uwaga: Pyannote wymaga tokena HF. Jeśli go nie ma, pomijamy diaryzację z warningiem.
-            hf_token = os.getenv("HF_TOKEN")
-            if not hf_token:
-                self.logger.warning("Brak HF_TOKEN. Pomijam diaryzację.")
-                return transcript_segments
-
-            if self.progress_callback: self.progress_callback(60, "Diaryzacja (rozpoznawanie mówców)...")
+            # 2. Diarization (Reuse self.diarization_pipeline)
+            self.logger.info("Starting diarization...", extra={"tags": "PYANNOTE"})
+            diarization = self.diarization_pipeline(audio_path)
             
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token
-            ).to(torch.device(self.device))
-            
-            diarization = pipeline(audio_path)
-            
-            # 3. Merge Whisper + Diarization
-            if self.progress_callback: self.progress_callback(80, "Łączenie wyników...")
-            final_segments = self._assign_speakers(transcript_segments, diarization)
-            
-            if self.progress_callback: self.progress_callback(100, "Gotowe!")
-            return final_segments
+            # 3. Join logic
+            return self._merge_results(transcript_segments, diarization)
 
         except Exception as e:
-            self.logger.error(f"Transcription error: {e}")
-            raise e
+            self.logger.error(f"Pipeline failed: {e}", extra={"tags": "MEDIA-ERROR"})
+            raise
 
-    def _assign_speakers(self, transcript_segments, diarization_result):
-        """
-        Prosty algorytm mapowania segmentów czasowych Whisper na mówców z Pyannote.
-        """
-        final_output = []
-        
-        for seg in transcript_segments:
-            # Znajdź mówcę, który mówił najdłużej w czasie trwania segmentu
-            seg_start = seg["start"]
-            seg_end = seg["end"]
+    def _merge_results(self, transcript, diarization) -> List[Dict[str, Any]]:
+        """Aligns Whisper timestamps with Pyannote speaker turns."""
+        final = []
+        for seg in transcript:
+            speaker = "Unknown"
+            max_intersection = 0
             
-            # Pobranie wszystkich nakładających się segmentów mówców
-            speakers = []
-            for turn, _, speaker in diarization_result.itertracks(yield_label=True):
-                # Sprawdź przecięcie (intersection)
-                intersection_start = max(seg_start, turn.start)
-                intersection_end = min(seg_end, turn.end)
-                
-                if intersection_end > intersection_start:
-                    duration = intersection_end - intersection_start
-                    speakers.append((speaker, duration))
+            for turn, _, label in diarization.itertracks(yield_label=True):
+                intersection = min(seg['end'], turn.end) - max(seg['start'], turn.start)
+                if intersection > max_intersection:
+                    max_intersection = intersection
+                    speaker = label
             
-            # Wybierz dominującego mówcę
-            if speakers:
-                best_speaker = max(speakers, key=lambda x: x[1])[0]
-                seg["speaker"] = best_speaker
-            else:
-                seg["speaker"] = "Unknown"
-                
-            final_output.append(seg)
-            
-        return final_output
+            seg['speaker'] = speaker
+            final.append(seg)
+        return final

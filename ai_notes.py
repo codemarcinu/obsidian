@@ -1,214 +1,129 @@
 import os
-import argparse
 import re
 import ollama
 import logging
 from datetime import datetime
-from tqdm import tqdm
 from typing import List, Optional, Tuple, Dict, Any
+from tqdm import tqdm
+from pathlib import Path
 
-# Use centralized config
 from config import ProjectConfig, logger
 from obsidian_manager import ObsidianGardener
 
 class TranscriptProcessor:
     """
-    Handles the processing of raw transcripts into structured Obsidian technical notes.
-    Refactored to support 'Human-in-the-Loop' (Edit before Save).
+    Refactored Note Generator: Converts raw transcripts into structured technical documentation.
+    Implements Point 6 (Compliance Tagging) and Point 1 (Direct Imports).
     """
     
     SYSTEM_PROMPT = """
-    Jesteś Ekspertem Technicznym i Analitykiem Cyberbezpieczeństwa. Tworzysz precyzyjną dokumentację techniczną w formacie Obsidian Markdown.
+    Jesteś Senior Python Architect i Security Engineer. Twoim zadaniem jest stworzenie profesjonalnej dokumentacji technicznej w formacie Markdown dla Obsidian.
 
-    Twoje zadanie: Przeanalizuj podany transkrypt wideo/szkolenia i stwórz zwięzłą, techniczną notatkę.
-
-    WYMAGANIA FORMATOWANIA:
-    1. Używaj TYLKO nagłówków H2 (##) dla głównych sekcji. Nie używaj H1 (tytuł jest w metadanych).
-    2. Kluczowe pojęcia, narzędzia i technologie pogrubiaj (np. **nmap**, **SQL Injection**).
-    3. WSZYSTKIE komendy, ścieżki plików, fragmenty kodu i logi umieszczaj w blokach kodu:
-       ```bash
-       nmap -sV 192.168.1.1
-       ```
-    4. Ignoruj całkowicie dygresje, żarty, powitania ("Cześć", "Dajcie suba") i lanie wody.
-    5. Pisz w stylu bezosobowym, technicznym (np. "Należy wykonać skan...", "Podatność polega na...").
-    6. Jeśli fragment nie zawiera konkretnej wiedzy, pomiń go.
-
-    CELEM JEST DOKŁADNOŚĆ. Nie zmyślaj. Opieraj się tylko na tekście.
+    ZASADY:
+    1. Nagłówki: ## dla sekcji, ### dla podsekcji.
+    2. Kod: Zawsze używaj bloków kodu z określeniem języka (bash, python, yaml).
+    3. Styl: Techniczny, zwięzły, bezosobowy.
+    4. Compliance: Jeśli temat dotyczy bezpieczeństwa, infrastruktury krytycznej lub danych, wyróżnij aspekty DORA, NIS2 lub RODO.
+    
+    WYJŚCIE: Tylko czysty Markdown.
     """
 
-    def __init__(self, vault_path: Optional[str] = None, model: str = None):
-        """
-        Initialize the processor with configurable vault path and model.
-        """
-        self.vault_path = vault_path if vault_path else str(ProjectConfig.OBSIDIAN_VAULT)
-        self.model = model if model else ProjectConfig.OLLAMA_MODEL
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or ProjectConfig.OLLAMA_MODEL
+        self.vault_path = ProjectConfig.OBSIDIAN_VAULT
         self.logger = logging.getLogger("TranscriptProcessor")
-        
-        # Ensure vault exists
-        os.makedirs(self.vault_path, exist_ok=True)
 
-    def clean_filename(self, title: str) -> str:
-        """Sanitizes the title for filesystem safety."""
-        title = title.lower()
-        title = re.sub(r'[^\w\s-]', '', title)
-        return re.sub(r'[\s_-]+', '-', title).strip('-')
-
-    def create_chunks(self, text: str, chunk_size: int = 6000, overlap: int = 500) -> List[str]:
-        """Splits text into overlapping chunks for context preservation."""
-        chunks = []
-        start = 0
-        text_len = len(text)
-        while start < text_len:
-            end = start + chunk_size
-            chunk = text[start:end]
-            chunks.append(chunk)
-            start += chunk_size - overlap
-        return chunks
-
-    def generate_metadata(self, text_sample: str) -> Tuple[str, str]:
-        """Generates a technical title and one-sentence summary."""
-        prompt = (
-            "Jesteś bibliotekarzem. Na podstawie tego fragmentu stwórz: "
-            "1. Krótki techniczny tytuł (max 6 słów, bez znaków specjalnych). "
-            "2. Jedno zdanie streszczenia."
-        )
+    def _generate_metadata(self, text: str) -> Tuple[str, str]:
+        """Uses LLM to generate title and short summary."""
+        prompt = "Na podstawie tekstu podaj: 1. Krótki tytuł techniczny (bez znaków specjalnych), 2. Jednozdaniowe podsumowanie."
         try:
-            response = ollama.chat(
-                model=self.model, 
-                messages=[{'role': 'system', 'content': prompt}, 
-                          {'role': 'user', 'content': text_sample[:2000]}],
-                options={'temperature': 0.3} # Precision mode
+            resp = ollama.chat(
+                model=self.model,
+                messages=[{'role': 'user', 'content': f"{prompt}\n\nTekst: {text[:2000]}"}]
             )
-            content = response['message']['content']
-            
-            # Simple parsing
+            content = resp['message']['content']
             lines = content.split('\n')
-            raw_title = lines[0].replace('Tytuł:', '').replace('1.', '').strip()
-            summary = lines[1].replace('Streszczenie:', '').replace('2.', '').strip() if len(lines) > 1 else "Brak podsumowania"
-            
-            return raw_title, summary
-        except Exception as e:
-            self.logger.error(f"Error generating metadata: {e}")
-            return "Szkolenie Cybersec AutoNote", "Automatycznie wygenerowana notatka."
+            title = lines[0].strip().replace("1. ", "").replace("Tytuł: ", "")
+            summary = lines[1].strip().replace("2. ", "").replace("Podsumowanie: ", "") if len(lines) > 1 else "Brak podsumowania."
+            return title, summary
+        except Exception:
+            return "Note-" + datetime.now().strftime("%Y%m%d-%H%M"), "Automatyczna notatka."
 
-    def detect_compliance(self, text: str) -> List[str]:
-        """Helper to identify DORA/RODO/NIS2 contexts in transcripts."""
-        found = []
+    def _detect_compliance_tags(self, text: str) -> List[str]:
+        """Advanced Compliance Tagging (DORA/NIS2/RODO)."""
+        tags = []
         text_lower = text.lower()
-        if any(kw in text_lower for kw in ["rodo", "gdpr", "osobowe"]): found.append("RODO")
-        if any(kw in text_lower for kw in ["dora", "rezyliencja", "ict"]): found.append("DORA")
-        if any(kw in text_lower for kw in ["nis2", "dyrektywa", "cyberbezpieczeństwo"]): found.append("NIS2")
-        return found if found else ["TBC"]
+        patterns = {
+            "DORA": ["dora", "rezyliencja", "incydent", "ciągłość działania", "ict risk"],
+            "NIS2": ["nis2", "infrastruktura krytyczna", "dyrektywa", "bezpieczeństwo sieci"],
+            "RODO": ["rodo", "gdpr", "dane osobowe", "prywatność", "przetwarzanie"],
+            "SECURITY": ["exploit", "podatność", "cve", "pentest", "hacker"]
+        }
+        for tag, keywords in patterns.items():
+            if any(kw in text_lower for kw in keywords):
+                tags.append(tag)
+        return tags or ["GENERAL"]
 
-    def generate_note_content(self, file_path: str) -> Dict[str, Any]:
-        """
-        Generates the note content BUT DOES NOT SAVE IT.
-        Returns a dictionary with 'title', 'content', 'tags'.
-        """
-        self.logger.info(f"Generating content for: {file_path}")
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                full_text = f.read()
-        except FileNotFoundError:
-            return {"error": f"File not found: {file_path}"}
+    def generate_note_content(self, transcript_file: str) -> Dict[str, Any]:
+        """Main pipeline to generate note structure."""
+        path = Path(transcript_file)
+        if not path.exists(): return {"error": "File not found"}
 
-        # Step 1: Metadata
-        raw_title, summary = self.generate_metadata(full_text)
-        safe_title = self.clean_filename(raw_title)[:60] or "unknown-training"
+        raw_text = path.read_text(encoding='utf-8')
+        title, summary = self._generate_metadata(raw_text)
         
-        # Step 2: Chunking
-        chunks = self.create_chunks(full_text)
-        full_notes = []
-        
-        # Step 3: AI Processing
-        for i, chunk in enumerate(tqdm(chunks, desc="AI Analysis", unit="chunk")):
+        # Simple chunking for LLM context window
+        chunks = [raw_text[i:i+5000] for i in range(0, len(raw_text), 4500)]
+        full_markdown = []
+
+        for i, chunk in enumerate(tqdm(chunks, desc="Generating Note Content")):
             try:
-                response = ollama.chat(
-                    model=self.model, 
-                    messages=[{'role': 'system', 'content': self.SYSTEM_PROMPT}, 
-                              {'role': 'user', 'content': chunk}],
-                    options={'temperature': 0.2} 
+                resp = ollama.chat(
+                    model=self.model,
+                    messages=[
+                        {'role': 'system', 'content': self.SYSTEM_PROMPT},
+                        {'role': 'user', 'content': f"Przetwórz fragment {i+1}:\n{chunk}"}
+                    ]
                 )
-                note_part = response['message']['content']
-                full_notes.append(f"\n## Część {i+1}\n{note_part}")
+                full_markdown.append(resp['message']['content'])
             except Exception as e:
-                full_notes.append(f"\n> [!ERROR] Chunk {i+1} failed: {e}")
+                self.logger.error(f"Chunk processing failed: {e}")
 
-        all_text = " ".join(full_notes)
-        compliance_tags = self.detect_compliance(all_text)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        combined_content = "\n\n".join(full_markdown)
+        compliance = self._detect_compliance_tags(combined_content)
         
-        # Assemble Markdown
-        markdown_content = f"""
---- 
-created: {timestamp}
-tags:
-  - auto-generated
-  - education
-  - transcript
+        # Metadata construction
+        header = f"""
+---
+created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
+tags: [auto-generated, {", ".join(compliance).lower()}]
+compliance: {compliance}
 status: to-review
-compliance: {compliance_tags}
 ---
 
-# {raw_title}
+# {title}
 
-> **Meta:** {summary}
-
----
-{chr(10).join(full_notes)}
+> **Summary:** {summary}
 
 ---
-*Generated by AI Bridge v2.2*
 """
         return {
-            "title": safe_title,
-            "content": markdown_content,
-            "tags": compliance_tags
+            "title": "".join(c for c in title if c.isalnum() or c in " -_").strip(),
+            "content": header + combined_content,
+            "tags": compliance # Compatibility with app.py UI
         }
 
     def save_note_to_disk(self, title: str, content: str) -> str:
-        """Saves the provided content to disk and runs the Gardener."""
-        date_prefix = datetime.now().strftime("%Y-%m-%d")
-        filename = f"{date_prefix}-{title}.md"
-        filepath = os.path.join(self.vault_path, filename)
+        """Saves note and triggers Gardener for auto-linking."""
+        safe_title = title.replace(" ", "-").lower()
+        filename = f"{datetime.now().strftime('%Y-%m-%d')}-{safe_title}.md"
+        file_path = self.vault_path / filename
         
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-            
-        self.logger.info(f"Note saved: {filepath}")
+        file_path.write_text(content, encoding='utf-8')
+        self.logger.info(f"Saved note: {file_path}", extra={"tags": "NOTE-SAVE"})
         
-        # Step 5: Gardener (Auto-linking)
-        gardener = ObsidianGardener(self.vault_path)
-        gardener.process_file(filepath)
+        # Trigger Gardener
+        gardener = ObsidianGardener()
+        gardener.process_file(str(file_path))
         
-        return filepath
-
-    # Legacy wrapper for CLI compatibility
-    def process_transcript(self, file_path: str) -> Tuple[bool, str]:
-        result = self.generate_note_content(file_path)
-        if "error" in result:
-            return False, result["error"]
-        
-        final_path = self.save_note_to_disk(result["title"], result["content"])
-        return True, final_path
-
-# CLI Compatibility Wrapper
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("file", help="Path to transcript file")
-    parser.add_argument("--output", help="Target Obsidian folder")
-    parser.add_argument("--model", help="Ollama model to use")
-    
-    args = parser.parse_args()
-    
-    processor = TranscriptProcessor(
-        vault_path=args.output,
-        model=args.model
-    )
-    
-    success, msg = processor.process_transcript(args.file)
-    if success:
-        print(f"SUCCESS: {msg}")
-    else:
-        print(f"ERROR: {msg}")
+        return str(file_path)

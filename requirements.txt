@@ -4,7 +4,7 @@ langchain-community==0.3.0
 langchain-ollama==0.2.0
 sentence-transformers==2.3.1
 pdfplumber==0.10.3
-yt-dlp==2023.12.30
+yt-dlp>=2025.01.01
 openai-whisper==20231117
 faster-whisper==0.10.0
 rapidfuzz==3.6.1

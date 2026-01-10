@@ -1,27 +1,25 @@
-import os
-import glob
 import hashlib
 import logging
 import time
-from typing import List, Dict, Generator, Set
+from typing import List, Dict, Set, Optional, Any
 from pathlib import Path
 
 import chromadb
-from chromadb.config import Settings
 import ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from tqdm import tqdm
 
 from config import ProjectConfig, logger
 
 class ObsidianRAG:
     """
-    Advanced RAG Engine with Smart Indexing and Incremental Updates.
-    Optimized for local LLMs (Ollama) and Markdown knowledge bases.
+    RAG Engine 2.0: Optimized for Incremental Indexing and local LLMs.
+    Features: MD5 change detection, Recursive splitting, and metadata enrichment.
     """
 
-    def __init__(self, db_path: Path = None):
-        self.db_path = db_path if db_path else ProjectConfig.DB_DIR
-        self.embedding_model = "mxbai-embed-large"  # High-performance local embedding
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path if db_path else ProjectConfig.CHROMA_DB_DIR
+        self.embedding_model = ProjectConfig.EMBEDDING_MODEL
         
         # Initialize Vector DB
         self.client = chromadb.PersistentClient(path=str(self.db_path))
@@ -32,218 +30,174 @@ class ObsidianRAG:
         
         self.logger = logging.getLogger("RAG-Engine")
         
-        # Text splitter optimized for Code & Markdown
+        # Text splitter optimized for Markdown and Code
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=ProjectConfig.CHUNK_SIZE,
-            chunk_overlap=ProjectConfig.CHUNK_OVERLAP,
+            chunk_size=ProjectConfig.RAG_CHUNK_SIZE,
+            chunk_overlap=ProjectConfig.RAG_CHUNK_OVERLAP,
             separators=["\n## ", "\n### ", "\n#### ", "\n", " ", ""],
             keep_separator=True
         )
 
-    def calculate_file_hash(self, file_path: str) -> str:
-        """Calculates MD5 hash of file content for change detection."""
-        hasher = hashlib.md5()
-        with open(file_path, 'rb') as f:
-            buf = f.read()
-            hasher.update(buf)
-        return hasher.hexdigest()
+    def _get_file_hash(self, file_path: Path) -> str:
+        """Generates MD5 hash for content validation."""
+        return hashlib.md5(file_path.read_bytes()).hexdigest()
 
-    def get_indexed_hashes(self) -> Dict[str, str]:
-        """Retrieves a map of {filename: hash} currently in DB."""
-        # This can be slow for huge DBs, but fine for personal <100k notes
-        # Optimized: Fetch only metadata
-        existing_data = self.collection.get(include=['metadatas'])
-        
-        file_hashes = {}
-        if existing_data and existing_data['metadatas']:
-            for meta in existing_data['metadatas']:
-                if 'filename' in meta and 'file_hash' in meta:
-                    file_hashes[meta['filename']] = meta['file_hash']
-        return file_hashes
+    def _get_indexed_metadata(self) -> Dict[str, Dict[str, str]]:
+        """
+        Builds a map of indexed files: {filename: {hash, mtime}}.
+        Used for incremental update logic.
+        """
+        results = self.collection.get(include=['metadatas'])
+        indexed = {}
+        if results and results['metadatas']:
+            for meta in results['metadatas']:
+                fname = meta.get('filename')
+                if fname:
+                    # We only need one entry per file to check hash/mtime
+                    indexed[fname] = {
+                        "hash": meta.get("file_hash"),
+                        "mtime": str(meta.get("mtime", ""))
+                    }
+        return indexed
 
-    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Batch generation of embeddings via Ollama."""
+    def _get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generates embeddings using local Ollama model."""
         embeddings = []
         for text in texts:
-            # TODO: Implement batching API if Ollama supports it in future
             try:
                 resp = ollama.embeddings(model=self.embedding_model, prompt=text)
                 embeddings.append(resp["embedding"])
             except Exception as e:
-                self.logger.error(f"Embedding failed: {e}")
-                # Return zero-vector fallback or re-raise? Re-raising to avoid bad data.
+                self.logger.error(f"Embedding failed for text fragment: {e}", extra={"tags": "RAG-ERROR"})
                 raise e
         return embeddings
 
-    def clean_stale_records(self, current_files: Set[str]):
-        """Removes vectors for files that no longer exist on disk."""
-        indexed_files = set(self.get_indexed_hashes().keys())
-        stale_files = indexed_files - current_files
-        
-        if stale_files:
-            self.logger.info(f"Cleaning up {len(stale_files)} deleted files from DB...")
-            for file in stale_files:
-                self.collection.delete(where={"filename": file})
-
-    def index_vault(self, vault_path: str) -> int:
+    def index_vault(self, vault_path: Path) -> int:
         """
-        Smart Incremental Indexing.
-        Returns number of newly indexed chunks.
+        Performs Incremental Indexing of the Obsidian Vault.
+        Only processes new or modified files.
         """
-        vault_path = Path(vault_path)
         if not vault_path.exists():
-            self.logger.error(f"Vault not found: {vault_path}")
+            self.logger.error(f"Vault path not found: {vault_path}")
             return 0
 
-        self.logger.info("Scanning vault for changes...")
-        all_md_files = list(vault_path.rglob("*.md"))
+        self.logger.info(f"Starting Incremental Indexing: {vault_path}", extra={"tags": "RAG-INDEX"})
+        all_files = list(vault_path.rglob("*.md"))
+        indexed_map = self._get_indexed_metadata()
         
-        # Get current state of DB
-        indexed_map = self.get_indexed_hashes()
+        new_chunks = 0
         current_filenames = set()
-        
-        new_chunks_count = 0
-        files_processed = 0
 
-        for file_path in all_md_files:
+        for file_path in tqdm(all_files, desc="Indexing Vault"):
+            if file_path.name.startswith('.'): continue
+            
             file_name = file_path.name
             current_filenames.add(file_name)
             
-            # Skip hidden files
-            if file_path.name.startswith('.'):
-                continue
-
             try:
-                current_hash = self.calculate_file_hash(str(file_path))
-                
-                # CHECK: Skip if hash matches DB
-                if file_name in indexed_map and indexed_map[file_name] == current_hash:
-                    continue
-                
-                # If we are here, file is new or changed.
-                # First, remove old version if exists
+                mtime = str(file_path.stat().st_mtime)
+                file_hash = self._get_file_hash(file_path)
+
+                # Skip if already indexed and unchanged
                 if file_name in indexed_map:
+                    if indexed_map[file_name]["hash"] == file_hash:
+                        continue
+                    
+                    # File changed -> Remove old vectors
                     self.collection.delete(where={"filename": file_name})
-                    self.logger.info(f"Updating modified file: {file_name}")
-                else:
-                    self.logger.info(f"Indexing new file: {file_name}")
+                    self.logger.info(f"Updating changed file: {file_name}")
 
-                # Read and Split
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
+                # Read and Chunk
+                content = file_path.read_text(encoding='utf-8')
                 chunks = self.splitter.split_text(content)
-                if not chunks: 
-                    continue
+                if not chunks: continue
 
-                # Prepare Data
-                ids = []
-                documents = []
-                metadatas = []
-                
-                embeddings = self.get_embeddings(chunks)
+                # Batch Upsert
+                ids = [f"{file_name}_{i}_{file_hash[:6]}" for i in range(len(chunks))]
+                embeddings = self._get_embeddings(chunks)
+                metadatas = [{
+                    "filename": file_name,
+                    "file_hash": file_hash,
+                    "mtime": mtime,
+                    "chunk_index": i,
+                    "source": str(file_path)
+                } for i in range(len(chunks))]
 
-                for i, chunk in enumerate(chunks):
-                    chunk_id = f"{file_name}_{i}_{current_hash[:6]}"
-                    ids.append(chunk_id)
-                    documents.append(chunk)
-                    metadatas.append({
-                        "source": str(file_path),
-                        "filename": file_name,
-                        "file_hash": current_hash,
-                        "chunk_index": i
-                    })
-
-                # Upsert
                 self.collection.upsert(
                     ids=ids,
                     embeddings=embeddings,
-                    documents=documents,
+                    documents=chunks,
                     metadatas=metadatas
                 )
-                
-                new_chunks_count += len(chunks)
-                files_processed += 1
+                new_chunks += len(chunks)
 
             except Exception as e:
-                self.logger.error(f"Failed to index {file_name}: {e}")
+                self.logger.error(f"Failed to process {file_name}: {e}")
 
-        # Garbage Collection
-        self.clean_stale_records(current_filenames)
+        # Cleanup deleted files
+        stale_files = set(indexed_map.keys()) - current_filenames
+        if stale_files:
+            self.logger.info(f"Removing {len(stale_files)} stale files from index.")
+            for sf in stale_files:
+                self.collection.delete(where={"filename": sf})
 
-        self.logger.info(f"Indexing complete. Processed {files_processed} files, added {new_chunks_count} chunks.")
-        return new_chunks_count
+        return new_chunks
 
-    def query(self, question: str, history: List[Dict] = None, n_results=5, model_name="mistral", stream=False):
+    def query(self, question: str, history: List[Dict] = None, n_results=5, model_name=None, stream=False):
         """
-        Retrieves context and queries LLM. 
-        Supports streaming generator.
+        Retrieves context and generates response using Ollama.
         """
-        # 1. Embed Query
+        model = model_name or ProjectConfig.OLLAMA_MODEL
+        
+        # 1. Embed Question
         try:
             q_embed = ollama.embeddings(model=self.embedding_model, prompt=question)["embedding"]
         except Exception as e:
             yield f"Error: Embedding model {self.embedding_model} not reachable."
             return
 
-        # 2. Retrieve
-        results = self.collection.query(
-            query_embeddings=[q_embed],
-            n_results=n_results
-        )
-
-        # 3. Format Context
+        # 2. Retrieve Context
+        results = self.collection.query(query_embeddings=[q_embed], n_results=n_results)
+        
         if not results['documents'] or not results['documents'][0]:
-            context = "No relevant notes found."
+            context = "Brak odpowiednich notatek w bazie wiedzy."
             sources = []
         else:
             docs = results['documents'][0]
             metas = results['metadatas'][0]
-            
-            context_parts = []
-            sources = set()
-            
-            for doc, meta in zip(docs, metas):
-                context_parts.append(f"--- NOTE: {meta['filename']} ---\n{doc}")
-                sources.add(meta['filename'])
-            
-            context = "\n".join(context_parts)
+            context = "\n".join([f"--- DOKUMENT: {m['filename']} ---\n{d}" for d, m in zip(docs, metas)])
+            sources = {m['filename'] for m in metas}
 
-        # 4. LLM Generation
-        system_prompt = f"""
-        You are a Second Brain Assistant. Use the following Context from user notes to answer the Question.
-        If the answer is not in the context, say so. Do not hallucinate.
+        # 3. Prompt Engineering
+        system_msg = f"""
+        Jesteś Asystentem Drugiego Mózgu. Odpowiadaj na pytania użytkownika, opierając się WYŁĄCZNIE na dostarczonym KONTEKŚCIE.
+        Jeśli odpowiedzi nie ma w kontekście, powiedz otwarcie, że nie wiesz. Nie zmyślaj faktów.
         
-        CONTEXT:
+        KONTEKST:
         {context}
         """
 
-        messages = [{'role': 'system', 'content': system_prompt}]
+        messages = [{'role': 'system', 'content': system_msg}]
         if history:
-            # Filter history to keep only user/assistant turns
-            valid_roles = {'user', 'assistant'}
-            messages.extend([m for m in history if m.get('role') in valid_roles])
-        
+            messages.extend([m for m in history if m.get('role') in ['user', 'assistant']])
         messages.append({'role': 'user', 'content': question})
 
+        # 4. LLM Call
         try:
-            stream_resp = ollama.chat(model=model_name, messages=messages, stream=True)
-            
-            for chunk in stream_resp:
-                content = chunk['message']['content']
-                if content:
-                    yield content
-            
-            # Append sources at the end
-            if sources:
-                yield "\n\n**Sources:**\n" + "\n".join([f"- `{s}`" for s in sources])
-
+            response = ollama.chat(model=model, messages=messages, stream=stream)
+            if stream:
+                for chunk in response:
+                    content = chunk['message']['content']
+                    if content: yield content
+                if sources:
+                    yield "\n\n**Źródła:**\n" + "\n".join([f"- [[{s}]]" for s in sources])
+            else:
+                yield response['message']['content']
         except Exception as e:
-            yield f"\n[System Error]: {e}"
+            self.logger.error(f"LLM Query failed: {e}", extra={"tags": "RAG-ERROR"})
+            yield f"Błąd systemowy: {e}"
 
 if __name__ == "__main__":
-    # Smoke Test
-    print("Testing RAG Engine...")
+    # Quick test
     rag = ObsidianRAG()
-    # rag.index_vault(ProjectConfig.OBSIDIAN_VAULT)
-    print("RAG initialized.")
+    print("RAG Engine 2.0 Ready.")
