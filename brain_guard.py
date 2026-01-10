@@ -160,10 +160,7 @@ class BrainGuardHandler(FileSystemEventHandler):
             )
 
             # 6. Archive Source Audio
-            audio_archive = ProjectConfig.OBSIDIAN_VAULT / "Zasoby" / "Audio"
-            audio_archive.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(file_path), audio_archive / file_path.name)
-            logger.info(f"Archived audio to: {audio_archive}")
+            self.gardener.archive_source_file(str(file_path), subfolder="Audio")
 
         except Exception as e:
             logger.error(f"Processing failed for {file_path}: {e}", exc_info=True)

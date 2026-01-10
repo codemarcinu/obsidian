@@ -1,5 +1,6 @@
 import os
 import datetime
+import shutil
 import logging
 from typing import List, Tuple, Optional
 from pathlib import Path
@@ -85,11 +86,13 @@ class ObsidianGardener:
 """
             daily_path.write_text(template, encoding='utf-8')
 
-        # Create Log Entry
+        # Create Log Entry with "Cyber-Secretary" style
+        timestamp = datetime.datetime.now().strftime("%H:%M")
         link = f"[[{title}]]" if title else "Nieznana notatka"
         
-        log_entry = f"\n### 🕒 {datetime.datetime.now().strftime('%H:%M')} - Przetworzono: {link}\n"
-        log_entry += f"**Synteza:** {summary[:300]}...\n"
+        log_entry = f"\n### 🤖 {timestamp} - Przetworzono: {link}\n"
+        log_entry += f"> {summary[:300]}...\n\n"
+        
         if tasks:
             log_entry += "**🛠️ Wykryte zadania:**\n"
             for task in tasks:
@@ -98,24 +101,30 @@ class ObsidianGardener:
             log_entry += "_Brak wykrytych zadań._\n"
 
         # Append to file
-        # Ideally, we should find "## 🤖 AI Inbox" and append after it, but appending to end is safer for now.
-        # Or read, find section, insert.
         try:
-            content = daily_path.read_text(encoding='utf-8')
-            if "## 🤖 AI Inbox" in content:
-                # Insert after the header
-                parts = content.split("## 🤖 AI Inbox")
-                new_content = parts[0] + "## 🤖 AI Inbox" + log_entry + parts[1]
-                daily_path.write_text(new_content, encoding='utf-8')
-            else:
-                # Just append if header missing
-                with open(daily_path, "a", encoding="utf-8") as f:
-                    f.write("\n" + log_entry)
+            with open(daily_path, "a", encoding="utf-8") as f:
+                f.write("\n" + log_entry)
             
             self.logger.info(f"Updated Daily Note: {daily_path}", extra={"tags": "GARDENER-DAILY"})
 
         except Exception as e:
             self.logger.error(f"Failed to update Daily Note: {e}")
+
+    def archive_source_file(self, source_path: str, subfolder: str = "Audio"):
+        """Archives the source file to Resources folder."""
+        try:
+            src = Path(source_path)
+            if not src.exists():
+                return
+                
+            archive_dir = self.vault_path / "Zasoby" / subfolder
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            
+            dest = archive_dir / src.name
+            shutil.move(str(src), str(dest))
+            self.logger.info(f"Archived file to: {dest}", extra={"tags": "GARDENER-ARCHIVE"})
+        except Exception as e:
+            self.logger.error(f"Failed to archive file: {e}")
 
     def suggest_semantic_links(self, text: str) -> str:
         """
