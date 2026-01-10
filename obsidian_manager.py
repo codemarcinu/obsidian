@@ -202,29 +202,65 @@ class ObsidianGardener:
                 clean_tags.add(t)
         return list(clean_tags)
 
-    def save_note(self, title: str, content: str, tags: List[str]) -> Path:
-        """Saves a new note to the vault with proper formatting."""
-        safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
-        filename = f"{safe_title}.md"
-        file_path = self.vault_path / filename
+    def save_note(self, title: str, content: str, tags: list) -> Path:
+        """Saves a markdown note to the vault with YAML frontmatter."""
+        filename = f"{title}.md"
+        # Sanitize filename
+        filename = "".join([c for c in filename if c.isalnum() or c in (' ', '.', '_', '-')]).strip()
         
-        # Format tags
-        tag_line = " ".join([f"#{t}" for t in tags])
+        full_path = self.vault_path / filename
         
-        # Assemble content
-        final_content = f"""# {title}
+        # Build YAML Frontmatter
+        frontmatter = "---\n"
+        frontmatter += f"title: {title}\n"
+        frontmatter += f"date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        if tags:
+            frontmatter += "tags:\n"
+            for t in tags:
+                # Ensure tag is clean
+                t = t.replace("#", "").strip().lower()
+                frontmatter += f"  - {t}\n"
+        frontmatter += "---\n\n"
+        
+        final_content = frontmatter + content
 
-{tag_line}
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(final_content)
+            
+        logger.info(f"Note saved with YAML: {full_path}", extra={"tags": "OBSIDIAN-SAVE"})
+        return full_path
 
-{content}
-"""
-        file_path.write_text(final_content, encoding='utf-8')
-        self.logger.info(f"Saved new note: {file_path}", extra={"tags": "GARDENER-SAVE"})
-        
-        # Update optimizer with new title so it's linkable immediately
-        self.optimizer.processor.add_keyword(safe_title, f"[[{safe_title}]]")
-        
-        return file_path
+    def smart_categorize(self, content: str) -> str:
+        """
+        Uses LLM to decide which folder the note belongs to.
+        """
+        try:
+            import ollama
+            from config import ProjectConfig
+            
+            categories = ["Education", "Newsy", "Research", "Zasoby", "Daily", "Prywatne"]
+            prompt = f"""
+            Przeanalizuj treść notatki i wybierz JEDNĄ najbardziej pasującą kategorię z listy: {', '.join(categories)}.
+            Zwróć tylko nazwę kategorii, nic więcej.
+            
+            Treść:
+            {content[:2000]}
+            """
+            
+            response = ollama.chat(
+                model=ProjectConfig.OLLAMA_MODEL_FAST,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            choice = response['message']['content'].strip()
+            
+            # Clean up response (sometimes LLM adds quotes or dots)
+            for cat in categories:
+                if cat.lower() in choice.lower():
+                    return cat
+            return "Zasoby" # Default if unsure
+        except Exception as e:
+            logger.error(f"Categorization failed: {e}")
+            return "Zasoby"
 
 
 if __name__ == "__main__":

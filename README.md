@@ -1,78 +1,72 @@
-# 🧠 AI Second Brain (Obsidian Pipeline) v4.0
+# 🧠 AI Second Brain (Obsidian Hybrid WSL Pipeline) v4.5
 
-Osobisty asystent wiedzy, który automatyzuje proces zbierania, przetwarzania i wyszukiwania informacji. System integruje się z Obsidianem, tworząc "Drugi Mózg" zasilany sztuczną inteligencją.
+Osobisty asystent wiedzy, który automatyzuje proces zbierania, przetwarzania i wyszukiwania informacji. System integruje się z Obsidianem, tworząc "Drugi Mózg" zasilany sztuczną inteligencją, działający w architekturze hybrydowej (WSL 2 + Windows).
 
-> **Wersja 4.0 (ETL):** Architektura została przebudowana na asynchroniczny potok ETL (Extract-Transform-Load), aby zapobiegać błędom OOM (Out Of Memory) na kartach GPU z ograniczoną pamięcią (np. RTX 3060 12GB).
+> **Wersja 4.5 (Auto-Gardener):** Dodano funkcję "BrainGuard" – automatycznego strażnika, który monitoruje folder Inbox, przetwarza pliki w tle i inteligentnie kategoryzuje notatki do odpowiednich folderów w Skarbcu.
 
 ## 🚀 Główne Funkcje
 
-1.  **ETL Pipeline (Nowość!):**
-    *   **Krok 1: Ingest (Pobieranie):** Pobiera wideo i transkrybuje dźwięk (Faster-Whisper), zapisując surowe dane do "Poczekalni" (`_INBOX`). Po zakończeniu natychmiast zwalnia pamięć VRAM.
-    *   **Krok 2: Refinery (Rafineria):** Przetwarza dane z Poczekalni. Używa LLM (Ollama) do generowania notatek, a następnie FlashText do błyskawicznego linkowania pojęć.
-2.  **Inteligentny Interfejs (Streamlit):**
-    *   Pełne spolszczenie interfejsu.
-    *   Zakładki oddzielające procesy obciążające GPU (Ingest) od procesów logicznych (Refinery).
-3.  **Zarządzanie Pamięcią:**
-    *   Agresywne zwalnianie modeli z VRAM (Load-Run-Unload).
-    *   Dedykowany moduł Garbage Collector.
+### 1. 🤖 BrainGuard (Automatyzacja "Drop & Forget")
+*   **Monitorowanie:** Skrypt nasłuchuje zmian w folderze `00_Inbox` na Windowsie.
+*   **Audio/Wideo:** Automatycznie wykrywa nowe pliki nagrań, wykonuje transkrypcję, generuje notatkę i archiwizuje plik źródłowy.
+*   **Notatki Tekstowe:** Przetwarza luźne notatki `.md` – dodaje tagi, linkuje pojęcia i formatuje YAML.
+*   **Inteligentna Kategoryzacja:** AI analizuje treść i automatycznie przenosi notatkę do jednego z folderów: `Education`, `Newsy`, `Research`, `Zasoby`, `Daily`, `Prywatne`.
 
-## 🛠️ Wymagania
+### 2. ⚡ ETL Pipeline (Interfejs UI)
+*   **Ingest:** Pobieranie i transkrypcja z YouTube URL.
+*   **Refinery:** Ręczne przetwarzanie i edycja transkryptów przed zapisaniem.
+*   **Optymalizacja VRAM:** Agresywne zwalnianie modeli z pamięci GPU po każdym zadaniu.
 
-*   System: Linux (zalecane) / Windows / macOS
-*   **GPU:** NVIDIA z obsługą CUDA (zalecane min. 8GB VRAM dla dużych modeli Whisper).
-*   Python 3.10+
-*   [Ollama](https://ollama.com/) (uruchomiona lokalnie)
-*   [FFmpeg](https://ffmpeg.org/) (do przetwarzania audio)
+### 3. 🔎 RAG & Chat (Baza Wiedzy)
+*   **Chat:** Możliwość rozmowy z własną bazą notatek (Retrieval Augmented Generation).
+*   **Indeksacja:** Wektorowa baza danych (ChromaDB) trzymana w szybkim systemie plików WSL.
 
-## 📦 Instalacja
+### 4. 🎨 UI & UX
+*   Ciemny motyw "Obsidian Dark" w interfejsie webowym.
+*   Pasek boczny nawigacji.
+*   Automatyczne linkowanie słów kluczowych (FlashText).
 
-1.  **Sklonuj repozytorium:**
+## 🛠️ Architektura Hybrydowa (WSL + Windows)
+
+System jest zaprojektowany do działania na **WSL 2 (Ubuntu)**, ale operuje na plikach znajdujących się na dysku **Windows**.
+
+*   **Obsidian Vault:** `/mnt/c/Users/marci/Documents/Obsidian Vault` (Windows)
+*   **Silnik AI & DB:** `/home/marcin/obsidian` (WSL - dla wydajności I/O)
+*   **Inbox:** Notatki trafiają do Windowsowego folderu `00_Inbox`, skąd są podejmowane przez system.
+
+## 📦 Instalacja i Uruchomienie
+
+1.  **Uruchomienie Interfejsu (UI):**
+    Służy do ręcznego pobierania filmów z YT, czatowania z bazą i zarządzania systemem.
     ```bash
-    git clone https://github.com/codemarcinu/obsidian.git
-    cd obsidian
+    streamlit run app.py
     ```
 
-2.  **Stwórz środowisko wirtualne:**
+2.  **Uruchomienie Strażnika (Tło):**
+    Służy do ciągłej automatyzacji folderu `00_Inbox`.
     ```bash
-    python3 -m venv venv
-    source venv/bin/activate
+    ./start_guard.sh
     ```
+    *Logi działania strażnika znajdują się w pliku `brain_guard.log`.*
 
-3.  **Zainstaluj zależności:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+## 📂 Struktura Folderów
 
-4.  **Konfiguracja:**
-    *   Upewnij się, że masz zainstalowany model w Ollama (np. `bielik`, `mistral`):
-        ```bash
-        ollama pull bielik
-        ```
-    *   Edytuj `config.py` lub `.env`, aby wskazać ścieżkę do swojego skarbca Obsidian (`OBSIDIAN_VAULT_PATH`).
+*   `00_Inbox/` - Tutaj wrzucasz pliki (mp3, md). System stąd je zabiera.
+    *   `Archive/` - Tutaj lądują przetworzone pliki audio.
+*   `Daily/` - Dzienniki.
+*   `Education/` - Notatki edukacyjne.
+*   `Newsy/` - Wiadomości i artykuły.
+*   `Prywatne/` - Notatki osobiste.
+*   `Research/` - Pogłębione analizy.
+*   `Zasoby/` - Inne materiały i wiedza ogólna.
 
-## ▶️ Uruchomienie
+## 🤖 Modele AI (Ollama)
 
-Aby uruchomić aplikację:
-
-```bash
-./run_brain.sh
-```
-*Skrypt automatycznie czyści pliki tymczasowe przed startem.*
-
-## 📂 Struktura Projektu
-
-*   `app.py` - Interfejs użytkownika (Streamlit) z podziałem na zakładki Ingest/Refinery.
-*   `video_transcriber.py` - Bezstanowy moduł transkrypcji (Whisper). Ładuje model tylko na czas pracy.
-*   `ai_notes.py` - Silnik generowania notatek (LLM -> Markdown).
-*   `obsidian_manager.py` - "Ogrodnik": Linkuje notatki (FlashText) i zarządza tagami.
-*   `utils/memory.py` - Narzędzia do czyszczenia VRAM i Cache.
-*   `obsidian_db/_INBOX` - Strefa buforowa dla przetworzonych transkrypcji (JSON).
-
-## 🤖 Modele AI
-
-*   **Transkrypcja:** `faster-whisper` (modele: base, small, medium, large-v3).
-*   **LLM:** Domyślnie `bielik` (konfigurowalne w `.env` lub `config.py`).
+System wykorzystuje lokalną instancję Ollama:
+*   **Bielik-11b-v2.3:** Główny "mózg" do generowania treści i analizy (wysoka jakość, język polski).
+*   **Llama 3.2:** Szybki model do tagowania i kategoryzacji (niskie opóźnienie).
+*   **Mxbai-embed-large:** Model embeddingów do wyszukiwania semantycznego.
 
 ## 📝 Licencja
 
-Projekt prywatny / MIT.
+Projekt prywatny.

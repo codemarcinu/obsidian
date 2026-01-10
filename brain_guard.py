@@ -3,8 +3,14 @@ import json
 import shutil
 import logging
 import sys
+import os
+
+# Ensure project root is in sys.path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import ollama
 from pathlib import Path
+from typing import List, Optional
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -33,8 +39,8 @@ class BrainGuardHandler(FileSystemEventHandler):
         self.transcriber = VideoTranscriber(model_size="medium") # Use medium for better accuracy
         self.processor = TranscriptProcessor()
         self.gardener = ObsidianGardener()
-        self.supported_extensions = {'.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4'}
-        logger.info("BrainGuard initialized and ready to protect.")
+        self.supported_extensions = {'.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', '.md'}
+        logger.info("BrainGuard initialized and ready to protect (Media + Notes).")
 
     def _extract_tasks(self, text: str) -> list[str]:
         """
@@ -81,7 +87,173 @@ class BrainGuardHandler(FileSystemEventHandler):
 
         if file_path.suffix.lower() in self.supported_extensions:
             logger.info(f"detected new file: {file_path}")
-            self.process_file(file_path)
+            # Wait for file to be fully written (important for MD files)
+            time.sleep(1)
+            
+            if file_path.suffix.lower() == '.md':
+                self.process_markdown_file(file_path)
+            else:
+                self.process_file(file_path)
+
+    def process_markdown_file(self, file_path: Path):
+        """Processes a markdown file looking for audio attachments."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            import re
+            # Pattern for ![[Recording 2026... .m4a]]
+            audio_pattern = r'!\[\[(.*?\.(mp3|wav|m4a|ogg|mp4))\]\]'
+            matches = re.findall(audio_pattern, content)
+
+            if not matches:
+                logger.info(f"No audio attachments in {file_path.name}. Processing as text note.")
+                # Treat as text note to be refined
+                self._refine_text_note(file_path, content)
+                return
+
+            for match in matches:
+                audio_filename = match[0]
+                
+                # Check if already transcribed
+                if f"Transkrypcja Nagrania: {audio_filename}" in content:
+                    logger.info(f"Skipping {audio_filename} - already transcribed in note.")
+                    continue
+                
+                logger.info(f"Found audio link: {audio_filename}")
+
+                # Search for the audio file in the vault
+                audio_path = self._find_file_in_vault(audio_filename)
+                
+                if audio_path:
+                    logger.info(f"Processing attached audio: {audio_path}")
+                    # 1. Transcribe
+                    json_path = self.transcriber.process_local_file(str(audio_path))
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        payload = json.load(f)
+                    
+                    raw_text = payload['content']
+                    
+                    # 2. Generate Note Snippet
+                    note_data = self.processor.generate_note_content_from_text(raw_text, meta={"title": audio_filename})
+                    
+                    # 3. Update the original Markdown file
+                    update_content = f"\n\n---\n## 🎤 Transkrypcja Nagrania: {audio_filename}\n\n"
+                    update_content += f"### 📝 Podsumowanie\n{note_data['summary']}\n\n"
+                    update_content += f"### 📜 Tekst\n{raw_text}\n"
+                    
+                    with open(file_path, 'a', encoding='utf-8') as f:
+                        f.write(update_content)
+                    
+                    logger.info(f"Updated note {file_path.name} with transcription.")
+
+                    # 3.5 Smart Move based on new content
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        full_content = f.read()
+                    
+                    category = self.gardener.smart_categorize(full_content)
+                    target_dir = ProjectConfig.OBSIDIAN_VAULT / category
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    if target_dir != file_path.parent:
+                        new_note_path = target_dir / file_path.name
+                        shutil.move(file_path, new_note_path)
+                        logger.info(f"Categorized and moved MD file to: {new_note_path}")
+
+                    # 4. Move audio to archive
+                    archive_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox" / "Archive"
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Move carefully in case it's in use
+                    try:
+                        shutil.move(audio_path, archive_dir / audio_filename)
+                        logger.info(f"Archived audio file to: {archive_dir / audio_filename}")
+                    except Exception as e:
+                        logger.warning(f"Could not move audio file (may be in use): {e}")
+                else:
+                    logger.warning(f"Could not find audio file: {audio_filename}")
+
+        except Exception as e:
+            logger.error(f"Failed to process MD file {file_path}: {e}")
+
+    def _refine_text_note(self, file_path: Path, content: str):
+        """Refines a raw text note: Links -> Tags -> Categorizes -> Moves."""
+        try:
+            # 1. Auto-Link (FlashText) & Semantic Links
+            linked_content = self.gardener.auto_link(content)
+            linked_content = self.gardener.suggest_semantic_links(linked_content)
+            
+            # 2. Generate Tags (LLM)
+            # We use the fast processor just to get tags, or re-use TranscriptProcessor logic?
+            # Let's use TranscriptProcessor to 'generate_note_content' but treating input as the text.
+            # But that might overwrite structure. We just want tags.
+            
+            # Let's ask LLM for tags for this content.
+            prompt = f"Proszę wygenerować 3-5 tagów (słowa kluczowe) dla poniższego tekstu. Zwróć tylko listę po przecinku.\n\n{content[:2000]}"
+            response = ollama.chat(
+                model=ProjectConfig.OLLAMA_MODEL_FAST,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            tags_str = response['message']['content']
+            tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+            
+            # 3. Save with YAML (This adds title, date, tags)
+            # We need to overwrite the file or save to a new location?
+            # Save uses `save_note` which writes to Vault Root. We want to categorize.
+            
+            # Let's construct the final content manually to preserve original text structure but add YAML.
+            # Check if YAML already exists?
+            if content.startswith('---'):
+                # Already has YAML, just append links if changed
+                final_content = linked_content
+            else:
+                # Add YAML
+                import datetime
+                frontmatter = "---\n"
+                frontmatter += f"title: {file_path.stem}\n"
+                frontmatter += f"date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                frontmatter += "tags:\n"
+                for t in tags:
+                    t = t.replace("#", "").strip().lower()
+                    frontmatter += f"  - {t}\n"
+                frontmatter += "---\n\n"
+                final_content = frontmatter + linked_content
+
+            # 4. Smart Categorize
+            category = self.gardener.smart_categorize(final_content)
+            target_dir = ProjectConfig.OBSIDIAN_VAULT / category
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
+            target_path = target_dir / file_path.name
+            
+            # Write to target
+            with open(target_path, 'w', encoding='utf-8') as f:
+                f.write(final_content)
+                
+            # Remove original if moved
+            if target_path != file_path:
+                file_path.unlink()
+                
+            logger.info(f"Refined and moved text note to: {target_path} (Category: {category})")
+            
+        except Exception as e:
+            logger.error(f"Failed to refine text note: {e}")
+
+    def _find_file_in_vault(self, filename: str) -> Optional[Path]:
+        """Deep search for a file in the vault."""
+        # Check current dir first
+        inbox_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox"
+        for p in inbox_dir.glob(filename):
+            return p
+            
+        # Then check vault root
+        for p in ProjectConfig.OBSIDIAN_VAULT.glob(filename):
+            return p
+            
+        # Then deep search
+        for p in ProjectConfig.OBSIDIAN_VAULT.rglob(filename):
+            return p
+        return None
 
     def process_file(self, file_path: Path):
         """
@@ -113,54 +285,38 @@ class BrainGuardHandler(FileSystemEventHandler):
             # 3. Extract Tasks
             tasks = self._extract_tasks(raw_text)
 
-            # 4. Save to Obsidian (Zasoby/Wiedza)
-            # Use 'Zasoby/Wiedza' as the destination folder, need to handle path in save_note?
-            # ObsidianGardener.save_note uses self.vault_path (root). 
-            # I should modify save_note to accept a subfolder or prepend it to title?
-            # No, save_note uses `self.vault_path / filename`.
-            # I will modify save_note call to handle subdirectories?
-            # Actually, `ObsidianGardener.save_note` takes `title`, `content`, `tags`.
-            # It saves to `self.vault_path`.
-            # I want to save to `Zasoby/Wiedza`.
-            # I will manually construct the path or move it after saving.
-            # OR, I can instantiate a Gardener with a specific path?
-            # Gardener init: `vault_path`.
-            # I can create a temporary gardener for `Zasoby/Wiedza`?
-            # Or just hack it: save, then move.
-            
-            # Let's check `save_note` implementation in `obsidian_manager.py`.
-            # It joins `self.vault_path / filename`.
-            # I'll modify `BrainGuard` to move the file after saving if needed, or just let it save in root for now (Inbox approach).
-            # But the plan said "tworzy notatkę merytoryczną w Zasoby/Wiedza".
-            
-            # Let's try to save directly to `Zasoby/Wiedza` by passing a modified title? No, title becomes filename.
-            # I will instantiate a specific gardener for the target folder?
-            # No, `ObsidianGardener` is designed for the whole vault.
-            # I will modify `save_note` in `obsidian_manager.py` to accept `subfolder` argument in a future iteration.
-            # For now, I'll use the default save (Vault Root) and then move it, or just accept it lands in root (or Education/ which is root).
-            
-            # ACTUALLY: The user has `obsidian_db` and `Education`. `Education` is the Vault.
-            # I want it in `Education/Zasoby/Wiedza`.
-            
-            saved_path = self.gardener.save_note(note_data['title'], note_data['content'], note_data['tags'])
-            
-            # Move to Zasoby/Wiedza
-            target_dir = ProjectConfig.OBSIDIAN_VAULT / "Zasoby" / "Wiedza"
+            # 4. Save to Obsidian (With Smart Categorization)
+            category = self.gardener.smart_categorize(note_data['content'])
+            target_dir = ProjectConfig.OBSIDIAN_VAULT / category
             target_dir.mkdir(parents=True, exist_ok=True)
-            target_path = target_dir / saved_path.name
-            shutil.move(saved_path, target_path)
-            logger.info(f"Moved note to: {target_path}")
+            
+            note_filename = f"{note_data['title']}.md"
+            target_path = target_dir / note_filename
+            
+            with open(target_path, 'w', encoding='utf-8') as f:
+                f.write(note_data['content'])
+            
+            logger.info(f"Saved and categorized note to: {target_path} (Category: {category})")
 
-            # 5. Update Daily Log
-            self.gardener.update_daily_log(
-                title=note_data['title'],
-                summary=note_data['summary'],
-                tasks=tasks,
-                note_path=str(target_path)
-            )
+            # 5. Archive Source Audio in 00_Inbox/Archive (regardless of target category)
+            inbox_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox"
+            archive_dir = inbox_dir / "Archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            
+            source_archive_path = archive_dir / file_path.name
+            shutil.move(file_path, source_archive_path)
+            logger.info(f"Archived source audio to: {source_archive_path}")
 
-            # 6. Archive Source Audio
-            self.gardener.archive_source_file(str(file_path), subfolder="Audio")
+            # 6. Update Daily Log (Optional - keeping it for history)
+            try:
+                self.gardener.update_daily_log(
+                    title=note_data['title'],
+                    summary=note_data['summary'],
+                    tasks=tasks,
+                    note_path=str(target_path)
+                )
+            except Exception as log_err:
+                logger.warning(f"Could not update daily log: {log_err}")
 
         except Exception as e:
             logger.error(f"Processing failed for {file_path}: {e}", exc_info=True)
@@ -172,6 +328,17 @@ if __name__ == "__main__":
     inbox_path.mkdir(parents=True, exist_ok=True)
     
     event_handler = BrainGuardHandler()
+    
+    # 0. Initial Scan of the Inbox
+    logger.info("Performing initial scan of 00_Inbox...")
+    for existing_file in inbox_path.iterdir():
+        if existing_file.is_file() and existing_file.suffix.lower() in event_handler.supported_extensions:
+            logger.info(f"Processing existing file: {existing_file.name}")
+            if existing_file.suffix.lower() == '.md':
+                event_handler.process_markdown_file(existing_file)
+            else:
+                event_handler.process_file(existing_file)
+
     observer = Observer()
     observer.schedule(event_handler, str(inbox_path), recursive=False)
     

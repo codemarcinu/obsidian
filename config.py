@@ -13,7 +13,10 @@ class Settings(BaseSettings):
     BASE_DIR: Path = Path(__file__).parent.resolve()
 
     # Paths
-    OBSIDIAN_VAULT: Path = Field(default=BASE_DIR / "Education")
+    # Twój skarbiec na Windows (dostępny przez WSL mount)
+    OBSIDIAN_VAULT: Path = Field(default=Path("/mnt/c/Users/marci/Documents/Obsidian Vault"))
+    
+    # Baza danych i pliki tymczasowe zostają w WSL (szybszy dostęp do plików)
     CHROMA_DB_DIR: Path = Field(default=BASE_DIR / "obsidian_db")
     INBOX_DIR: Path = Field(default=BASE_DIR / "obsidian_db" / "_INBOX")
     TEMP_DIR: Path = Field(default=BASE_DIR / "temp_processing")

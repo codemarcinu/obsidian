@@ -19,6 +19,27 @@ from obsidian_manager import ObsidianGardener
 # Initialize Page
 st.set_page_config(page_title="Obsidian AI Bridge v4.0 (ETL)", layout="wide", page_icon="⚡")
 
+# --- CUSTOM CSS ---
+st.markdown("""
+<style>
+    /* Ukrycie domyślnego menu i stopki */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    /* Stylizacja Sidebaru */
+    [data-testid="stSidebar"] {
+        background-color: #2d2d2d;
+        border-right: 1px solid #3d3d3d;
+    }
+    
+    /* Przyciski */
+    .stButton > button {
+        border-radius: 8px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # --- UTILS ---
 
 def load_inbox_items() -> List[Path]:
@@ -49,37 +70,67 @@ def get_file_summary(path: Path) -> dict:
 with st.sidebar:
     st.title("⚡ AI Second Brain")
     st.caption("v4.0 • Architektura Async ETL")
-    st.info("System optymalizuje użycie VRAM poprzez oddzielenie pobierania (Whisper) od przetwarzania (LLM).")
+    
+    # Navigation
+    st.markdown("### 🧭 Nawigacja")
+    selected_page = st.radio(
+        "Idź do:",
+        [
+            "📥 Pobieranie (Ingest)", 
+            "🏭 Przetwarzanie (Refinery)",
+            "🔎 Baza Wiedzy (RAG)",
+            "📰 Research & News",
+            "⚙️ System"
+        ],
+        label_visibility="collapsed"
+    )
     
     st.divider()
-    st.markdown("### 📊 Stan Kolejki")
+    
+    # Inbox Status
     inbox_files = load_inbox_items()
-    st.metric("Oczekujące w Inbox", len(inbox_files))
-
-# --- TABS ---
-tab_ingest, tab_refinery, tab_rag, tab_research, tab_debug = st.tabs([
-    "📥 Pobieranie (Ingest)", 
-    "🏭 Przetwarzanie (Refinery)",
-    "🔎 Baza Wiedzy",
-    "📰 Research & News",
-    "⚙️ System"
-])
+    st.markdown("### 📊 Stan Kolejki")
+    col_met, col_ref = st.columns([2, 1])
+    with col_met:
+        st.metric("Inbox", len(inbox_files))
+    with col_ref:
+        st.write("") # wyrównanie do linii metryki
+        if st.button("🔄", help="Odśwież listę plików"):
+            st.rerun()
+    
+    if len(inbox_files) > 0:
+        st.info(f"Najnowszy: {inbox_files[0].name[:20]}...")
+    
+    st.divider()
+    st.info("System optymalizuje użycie VRAM poprzez oddzielenie pobierania (Whisper) od przetwarzania (LLM).")
 
 # ==============================================================================
-# TAB 1: INGEST (Extract)
+# MAIN CONTENT AREA
+# ==============================================================================
+
+# ==============================================================================
+# PAGE 1: INGEST (Extract)
 # Goal: Download -> Transcribe -> Save JSON to Inbox -> Release VRAM
 # ==============================================================================
-with tab_ingest:
+if selected_page == "📥 Pobieranie (Ingest)":
     st.header("1. Pobieranie Mediów")
+    st.caption("Pobierz audio z YouTube lub pliku, wykonaj transkrypcję i zapisz do Inbox.")
     
     # Wybór źródła
-    source_type = st.radio("Źródło:", ["YouTube URL", "Plik Lokalny (mp3, wav, m4a)"], horizontal=True)
-    model_size = st.selectbox("Model Whisper", ["base", "small", "medium", "large-v3"], index=2)
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        source_type = st.radio("Źródło:", ["YouTube URL", "Plik Lokalny (mp3, wav, m4a)"])
+        model_size = st.selectbox("Model Whisper", ["base", "small", "medium", "large-v3"], index=2)
+    
+    with col2:
+        if source_type == "YouTube URL":
+            video_url = st.text_input("YouTube URL:", placeholder="https://youtube.com/watch?v=...")
+            uploaded_file = None
+        else:
+            video_url = None
+            uploaded_file = st.file_uploader("Wrzuć nagranie", type=['mp3', 'wav', 'm4a', 'ogg'])
 
-    if source_type == "YouTube URL":
-        video_url = st.text_input("YouTube URL:", placeholder="https://youtube.com/watch?v=...")
-    else:
-        uploaded_file = st.file_uploader("Wrzuć nagranie", type=['mp3', 'wav', 'm4a', 'ogg'])
+    st.divider()
 
     if st.button("🚀 Rozpocznij Proces", type="primary", use_container_width=True):
         if source_type == "YouTube URL":
@@ -137,9 +188,7 @@ with tab_ingest:
                 }
                 
                 status.write("🎧 Transkrypcja (Whisper)...")
-                # Wywołujemy transkrypcję (zakładamy że _run_transcription_isolated istnieje i jest dostępna)
-                # Jeśli nie, używamy process_to_inbox ale on ściąga z URL. 
-                # Zgodnie z planem użytkownika, używamy _run_transcription_isolated.
+                # Wywołujemy transkrypcję
                 transcript_data = transcriber._run_transcription_isolated(str(save_path))
                 
                 # Zapis do Inbox
@@ -168,10 +217,10 @@ with tab_ingest:
                 logger.error(f"Local Ingest Error: {e}")
 
 # ==============================================================================
-# TAB 2: REFINERY (Transform & Load)
+# PAGE 2: REFINERY (Transform & Load)
 # Goal: Load JSON -> Generate Note (LLM) -> Link (FlashText) -> Save to Vault
 # ==============================================================================
-with tab_refinery:
+elif selected_page == "🏭 Przetwarzanie (Refinery)":
     st.header("2. Rafineria Wiedzy")
     
     if not inbox_files:
@@ -179,15 +228,31 @@ with tab_refinery:
     else:
         # Selection Logic
         file_options = {f.name: f for f in inbox_files}
-        selected_file_name = st.selectbox(
-            "Wybierz element z Inbox:", 
-            options=list(file_options.keys()),
-            format_func=lambda x: f"📄 {x}"
-        )
+        
+        col_sel, col_act = st.columns([3, 1])
+        with col_sel:
+            selected_file_name = st.selectbox(
+                "Wybierz element z Inbox:", 
+                options=list(file_options.keys()),
+                format_func=lambda x: f"📄 {x}"
+            )
         
         selected_path = file_options[selected_file_name]
         summary = get_file_summary(selected_path)
         data = summary['data']
+
+        # UX: Przycisk usuwania
+        with col_act:
+            st.write("") # Spacer
+            st.write("") 
+            if st.button("🗑️ Usuń plik", type="secondary", use_container_width=True):
+                try:
+                    selected_path.unlink()
+                    st.toast(f"Usunięto plik: {selected_path.name}")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Nie udało się usunąć: {e}")
 
         if data:
             st.divider()
@@ -195,16 +260,12 @@ with tab_refinery:
             with c1:
                 st.subheader(summary['title'])
                 st.caption(f"Przetworzono: {summary['date']}")
-                st.text_area("Surowy Transkrypt (Podgląd)", data.get('content', '')[:1000]+"...", height=200, disabled=True)
+                st.text_area("Surowy Transkrypt (Podgląd)", data.get('content', '')[:1000]+"...", height=400, disabled=True)
             
             with c2:
                 st.markdown("### Konfiguracja AI")
                 prompt_style = st.selectbox("Styl Notatki", ["Akademicki", "Blog Post", "Wypunktowanie", "Podsumowanie"])
                 
-                # Mapping style names for backend compatibility if needed, 
-                # but currently ai_notes.py handles strings. 
-                # Let's adjust mapping to match ai_notes expectations or update ai_notes.
-                # Since I can't see ai_notes logic for these exact strings, I will map them.
                 style_map = {
                     "Akademicki": "Academic",
                     "Blog Post": "Blog Post",
@@ -212,7 +273,9 @@ with tab_refinery:
                     "Podsumowanie": "Summary"
                 }
                 
-                if st.button("🧠 Generuj Notatkę Obsidian", type="primary"):
+                st.info("Model przeanalizuje transkrypt, wygeneruje notatkę w Markdown i automatycznie podlinkuje słowa kluczowe z Twojego skarbca.")
+                
+                if st.button("🧠 Generuj Notatkę Obsidian", type="primary", use_container_width=True):
                     with st.spinner("Ładowanie LLM i Generowanie..."):
                         try:
                             # 1. Generate Content (LLM)
@@ -241,15 +304,18 @@ with tab_refinery:
                             selected_path.rename(archive_dir / selected_path.name)
                             
                             st.success(f"Utworzono notatkę: `{saved_path.name}`")
+                            st.balloons()
+                            time.sleep(2)
                             st.rerun()
                             
                         except Exception as e:
                             st.error(f"Błąd Rafinerii: {e}")
+                            logger.error(f"Refinery Error: {e}")
 
 # ==============================================================================
-# TAB 3: RAG (Knowledge Base Chat)
+# PAGE 3: RAG (Knowledge Base Chat)
 # ==============================================================================
-with tab_rag:
+elif selected_page == "🔎 Baza Wiedzy (RAG)":
     st.header("🔎 Czat z Bazą Wiedzy (RAG)")
     
     # 1. Inicjalizacja RAG (Lazy loading)
@@ -258,20 +324,32 @@ with tab_rag:
             from rag_engine import ObsidianRAG
             with st.spinner("Ładowanie silnika wektorowego (ChromaDB)..."):
                 st.session_state.rag_engine = ObsidianRAG()
-                st.success("Silnik RAG gotowy.")
+                st.toast("Silnik RAG załadowany pomyślnie.")
         except Exception as e:
             st.error(f"Nie udało się załadować RAG: {e}")
             st.stop()
 
     rag = st.session_state.rag_engine
 
-    # 2. Panel boczny - Indeksowanie
-    with st.expander("⚙️ Zarządzanie Indeksem"):
-        st.caption("Uruchom, gdy dodasz nowe notatki do Obsidiana.")
-        if st.button("🔄 Przeindeksuj Skarbiec (Incremental)"):
-            with st.spinner("Aktualizacja wektorów..."):
-                added = rag.index_vault(ProjectConfig.OBSIDIAN_VAULT)
-                st.success(f"Zindeksowano nowych fragmentów: {added}")
+    col_idx, col_clear = st.columns([3, 1])
+    
+    # 2. Panel zarządzania
+    with col_idx:
+        with st.expander("⚙️ Zarządzanie Indeksem"):
+            st.caption("Uruchom, gdy dodasz nowe notatki do Obsidiana.")
+            if st.button("🔄 Przeindeksuj Skarbiec (Incremental)"):
+                with st.spinner("Aktualizacja wektorów..."):
+                    added = rag.index_vault(ProjectConfig.OBSIDIAN_VAULT)
+                    st.success(f"Zindeksowano nowych fragmentów: {added}")
+    
+    with col_clear:
+        # UX: Przycisk czyszczenia historii
+        st.write("") # spacer
+        if st.button("🧹 Wyczyść Czat", type="secondary"):
+            st.session_state.messages = []
+            st.rerun()
+
+    st.divider()
 
     # 3. Interfejs Czatu
     if "messages" not in st.session_state:
@@ -318,17 +396,17 @@ with tab_rag:
                 st.error(f"Błąd generowania: {e}")
 
 # ==============================================================================
-# TAB 4: RESEARCH & NEWS
+# PAGE 4: RESEARCH & NEWS
 # ==============================================================================
-with tab_research:
+elif selected_page == "📰 Research & News":
     st.header("📰 Agent Newsowy i Research")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("Daily Cybersec Briefing")
-        st.caption("Pobiera newsy z Sekuraka, Zaufanej Trzeciej Strony itp.")
-        if st.button("uruchom NewsAgenta"):
+        st.caption("Pobiera newsy z zdefiniowanych kanałów RSS.")
+        if st.button("Uruchom NewsAgenta"):
             from news_agent import NewsAgent
             agent = NewsAgent()
             with st.status("Analiza RSS...", expanded=True) as status:
@@ -337,6 +415,7 @@ with tab_research:
     
     with col2:
         st.subheader("Web Research (URL)")
+        st.caption("Tworzy notatkę na podstawie artykułu internetowego.")
         target_url = st.text_input("Wklej link do artykułu/dokumentacji:")
         if st.button("Analizuj Artykuł"):
             if target_url:
@@ -350,8 +429,8 @@ with tab_research:
                         st.error("Błąd pobierania.")
 
 # ==============================================================================
-# TAB 5: SYSTEM DEBUG
+# PAGE 5: SYSTEM DEBUG
 # ==============================================================================
-with tab_debug:
-    st.write("Konfiguracja Systemu:")
+elif selected_page == "⚙️ System":
+    st.header("⚙️ Konfiguracja Systemu")
     st.json(ProjectConfig.model_dump())

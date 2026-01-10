@@ -1,0 +1,1 @@
+Dzisiaj myślałem o tym, jak połączyć Pythona z moim systemem notowania. Obsidian jest świetny, ale brakuje mi automatyzacji. Muszę sprawdzić bibliotekę watchdog w Pythonie, żeby automatycznie katalogować pliki. To by mi bardzo pomogło w nauce programowania.
