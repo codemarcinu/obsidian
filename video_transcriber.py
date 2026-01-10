@@ -124,6 +124,52 @@ class VideoTranscriber:
             self.logger.error(f"ETL Process Failed: {e}", extra={"tags": "FATAL"})
             raise
 
+    def process_local_file(self, file_path: str, progress_callback=None) -> str:
+        """
+        Process a local audio file directly (Watchdog mode).
+        """
+        try:
+            path = Path(file_path)
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+            # 1. Metadata
+            meta = {
+                "id": path.stem,
+                "title": path.stem,
+                "uploader": "Local User",
+                "duration": 0, # Could be extracted with ffmpeg/pydub if needed
+                "local_path": str(path),
+                "url": "local"
+            }
+
+            # 2. Transcribe
+            transcript_data = self._run_transcription_isolated(str(path), progress_callback)
+
+            # 3. Construct Payload
+            payload = {
+                "meta": meta,
+                "content": transcript_data['text'],
+                "segments": transcript_data['segments'],
+                "processed_at": time.time(),
+                "status": "ready_for_refinery"
+            }
+
+            # 4. Save to INBOX (System Inbox for processing)
+            safe_title = "".join([c for c in meta['id'] if c.isalnum() or c in ('-','_')])
+            output_filename = f"{safe_title}.json"
+            output_path = ProjectConfig.INBOX_DIR / output_filename
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                
+            self.logger.info(f"Saved local payload to Inbox: {output_path}", extra={"tags": "ETL-LOAD-LOCAL"})
+            return str(output_path)
+
+        except Exception as e:
+            self.logger.error(f"Local Process Failed: {e}", extra={"tags": "FATAL"})
+            raise
+
     def _run_transcription_isolated(self, audio_path: str, progress_callback=None) -> Dict[str, Any]:
         """
         Runs Whisper in an isolated manner. Loads model, processes, then forces unload.

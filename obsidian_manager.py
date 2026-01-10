@@ -1,4 +1,5 @@
 import os
+import datetime
 import logging
 from typing import List, Tuple, Optional
 from pathlib import Path
@@ -61,6 +62,60 @@ class ObsidianGardener:
         if not self.rag:
             self.rag = ObsidianRAG()
         return self.rag
+
+    def update_daily_log(self, title: str, summary: str, tasks: List[str], note_path: str = None):
+        """
+        Appends a processing report to the Daily Note.
+        """
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        daily_folder = self.vault_path / "Daily"
+        daily_folder.mkdir(parents=True, exist_ok=True)
+        daily_path = daily_folder / f"{today}.md"
+        
+        # Ensure Daily Note exists
+        if not daily_path.exists():
+            template = f"""# 📅 Daily Note: {today}
+
+## 🎯 Priorytety na dziś (The Big 3)
+- [ ] 
+
+## 🤖 AI Inbox (Raporty od Asystenta)
+
+## 📝 Notatki bieżące
+"""
+            daily_path.write_text(template, encoding='utf-8')
+
+        # Create Log Entry
+        link = f"[[{title}]]" if title else "Nieznana notatka"
+        
+        log_entry = f"\n### 🕒 {datetime.datetime.now().strftime('%H:%M')} - Przetworzono: {link}\n"
+        log_entry += f"**Synteza:** {summary[:300]}...\n"
+        if tasks:
+            log_entry += "**🛠️ Wykryte zadania:**\n"
+            for task in tasks:
+                log_entry += f"- [ ] {task}\n"
+        else:
+            log_entry += "_Brak wykrytych zadań._\n"
+
+        # Append to file
+        # Ideally, we should find "## 🤖 AI Inbox" and append after it, but appending to end is safer for now.
+        # Or read, find section, insert.
+        try:
+            content = daily_path.read_text(encoding='utf-8')
+            if "## 🤖 AI Inbox" in content:
+                # Insert after the header
+                parts = content.split("## 🤖 AI Inbox")
+                new_content = parts[0] + "## 🤖 AI Inbox" + log_entry + parts[1]
+                daily_path.write_text(new_content, encoding='utf-8')
+            else:
+                # Just append if header missing
+                with open(daily_path, "a", encoding="utf-8") as f:
+                    f.write("\n" + log_entry)
+            
+            self.logger.info(f"Updated Daily Note: {daily_path}", extra={"tags": "GARDENER-DAILY"})
+
+        except Exception as e:
+            self.logger.error(f"Failed to update Daily Note: {e}")
 
     def suggest_semantic_links(self, text: str) -> str:
         """
