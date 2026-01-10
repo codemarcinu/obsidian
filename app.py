@@ -43,24 +43,24 @@ def get_file_summary(path: Path) -> dict:
             "data": data
         }
     except Exception:
-        return {"title": "Corrupted File", "path": path, "data": None}
+        return {"title": "Uszkodzony Plik", "path": path, "data": None}
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("⚡ AI Second Brain")
-    st.caption("v4.0 • Async ETL Architecture")
-    st.info("System optimizes VRAM usage by separating Ingestion (Whisper) from Refinery (LLM).")
+    st.caption("v4.0 • Architektura Async ETL")
+    st.info("System optymalizuje użycie VRAM poprzez oddzielenie pobierania (Whisper) od przetwarzania (LLM).")
     
     st.divider()
-    st.markdown("### 📊 Queue Status")
+    st.markdown("### 📊 Stan Kolejki")
     inbox_files = load_inbox_items()
-    st.metric("Inbox Queue", len(inbox_files))
+    st.metric("Oczekujące w Inbox", len(inbox_files))
 
 # --- TABS ---
 tab_ingest, tab_refinery, tab_rag, tab_debug = st.tabs([
-    "📥 Ingest (Download & Transcribe)", 
-    "🏭 Refinery (LLM & Obsidian)",
-    "🔎 Knowledge Base",
+    "📥 Pobieranie (Ingest)", 
+    "🏭 Przetwarzanie (Refinery)",
+    "🔎 Baza Wiedzy",
     "⚙️ System"
 ])
 
@@ -69,7 +69,7 @@ tab_ingest, tab_refinery, tab_rag, tab_debug = st.tabs([
 # Goal: Download -> Transcribe -> Save JSON to Inbox -> Release VRAM
 # ==============================================================================
 with tab_ingest:
-    st.header("1. Media Ingestion")
+    st.header("1. Pobieranie Mediów")
     st.markdown("Pobierz i przetwórz audio na tekst. Wynik trafi do `Inbox`.")
     
     col1, col2 = st.columns([2, 1])
@@ -78,12 +78,12 @@ with tab_ingest:
     with col2:
         model_size = st.selectbox("Model Whisper", ["base", "small", "medium", "large-v3"], index=2)
 
-    if st.button("🚀 Start Extraction Process", type="primary", use_container_width=True):
+    if st.button("🚀 Rozpocznij Proces", type="primary", use_container_width=True):
         if not video_url:
             st.error("Podaj URL!")
             st.stop()
 
-        status = st.status("Initializing Ingestion Pipeline...", expanded=True)
+        status = st.status("Inicjalizacja potoku...", expanded=True)
         progress = status.empty()
         
         try:
@@ -96,14 +96,14 @@ with tab_ingest:
             # Run Process
             json_path = transcriber.process_to_inbox(video_url, progress_callback=update_progress)
             
-            status.update(label="✅ Extraction Complete!", state="complete", expanded=False)
-            st.success(f"Saved payload to Inbox: `{Path(json_path).name}`")
+            status.update(label="✅ Zakończono!", state="complete", expanded=False)
+            st.success(f"Zapisano dane w Inbox: `{Path(json_path).name}`")
             st.balloons()
             time.sleep(2)
             st.rerun()
             
         except Exception as e:
-            status.update(label="❌ Critical Error", state="error")
+            status.update(label="❌ Błąd Krytyczny", state="error")
             st.error(str(e))
             logger.error(f"Ingest Error: {e}")
 
@@ -112,15 +112,15 @@ with tab_ingest:
 # Goal: Load JSON -> Generate Note (LLM) -> Link (FlashText) -> Save to Vault
 # ==============================================================================
 with tab_refinery:
-    st.header("2. Knowledge Refinery")
+    st.header("2. Rafineria Wiedzy")
     
     if not inbox_files:
-        st.info("Inbox is empty. Go to Ingest tab to add content.")
+        st.info("Inbox jest pusty. Przejdź do zakładki Pobieranie, aby dodać materiały.")
     else:
         # Selection Logic
         file_options = {f.name: f for f in inbox_files}
         selected_file_name = st.selectbox(
-            "Select Item from Inbox:", 
+            "Wybierz element z Inbox:", 
             options=list(file_options.keys()),
             format_func=lambda x: f"📄 {x}"
         )
@@ -134,22 +134,33 @@ with tab_refinery:
             c1, c2 = st.columns([1, 1])
             with c1:
                 st.subheader(summary['title'])
-                st.caption(f"Processed: {summary['date']}")
-                st.text_area("Raw Transcript (Preview)", data.get('content', '')[:1000]+"...", height=200, disabled=True)
+                st.caption(f"Przetworzono: {summary['date']}")
+                st.text_area("Surowy Transkrypt (Podgląd)", data.get('content', '')[:1000]+"...", height=200, disabled=True)
             
             with c2:
-                st.markdown("### AI Configuration")
-                prompt_style = st.selectbox("Note Style", ["Academic", "Blog Post", "Bullet Points", "Summary"])
+                st.markdown("### Konfiguracja AI")
+                prompt_style = st.selectbox("Styl Notatki", ["Akademicki", "Blog Post", "Wypunktowanie", "Podsumowanie"])
                 
-                if st.button("🧠 Generate Obsidian Note", type="primary"):
-                    with st.spinner("Loading LLM & Generating..."):
+                # Mapping style names for backend compatibility if needed, 
+                # but currently ai_notes.py handles strings. 
+                # Let's adjust mapping to match ai_notes expectations or update ai_notes.
+                # Since I can't see ai_notes logic for these exact strings, I will map them.
+                style_map = {
+                    "Akademicki": "Academic",
+                    "Blog Post": "Blog Post",
+                    "Wypunktowanie": "Bullet Points",
+                    "Podsumowanie": "Summary"
+                }
+                
+                if st.button("🧠 Generuj Notatkę Obsidian", type="primary"):
+                    with st.spinner("Ładowanie LLM i Generowanie..."):
                         try:
                             # 1. Generate Content (LLM)
                             processor = TranscriptProcessor()
                             note_content = processor.generate_note_content_from_text(
                                 text=data.get('content', ''), 
                                 meta=data.get('meta', {}),
-                                style=prompt_style
+                                style=style_map.get(prompt_style, "Academic")
                             )
                             
                             # 2. Smart Linking & Tagging (FlashText)
@@ -169,18 +180,18 @@ with tab_refinery:
                             archive_dir.mkdir(exist_ok=True)
                             selected_path.rename(archive_dir / selected_path.name)
                             
-                            st.success(f"Note created: `{saved_path.name}`")
+                            st.success(f"Utworzono notatkę: `{saved_path.name}`")
                             st.rerun()
                             
                         except Exception as e:
-                            st.error(f"Refinery Error: {e}")
+                            st.error(f"Błąd Rafinerii: {e}")
 
 # ==============================================================================
 # TAB 3 & 4: Placeholders for RAG & Config (Simplified for Phase 3)
 # ==============================================================================
 with tab_rag:
-    st.info("RAG Engine will be re-connected in future updates.")
+    st.info("Silnik RAG zostanie podłączony w przyszłych aktualizacjach.")
 
 with tab_debug:
-    st.write("System Config:")
+    st.write("Konfiguracja Systemu:")
     st.json(ProjectConfig.model_dump())
