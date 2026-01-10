@@ -174,8 +174,17 @@ class ObsidianRAG:
                 messages.extend([m for m in history if m.get('role') in ['user', 'assistant']])
             messages.append({'role': 'user', 'content': question})
 
-            return ollama.chat(model=model, messages=messages, stream=stream)
+            # Force stream=True if the function is used as a generator in app.py
+            # But let's respect the flag. If stream is True, we yield chunks.
+            # If stream is False, we yield the single response dict (so loop in app.py runs once).
+            response = ollama.chat(model=model, messages=messages, stream=stream)
+            
+            if stream:
+                yield from response
+            else:
+                yield response
 
         except Exception as e:
             self.logger.error(f"LLM Query failed: {e}")
-            yield f"Błąd systemowy: {e}"
+            # Yield error in a format compatible with chunk.get('message', {}).get('content')
+            yield {"message": {"content": f"⚠️ Błąd systemowy: {e}"}}

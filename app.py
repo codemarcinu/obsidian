@@ -299,7 +299,8 @@ with tab_rag:
                 stream = rag.query(
                     question=prompt, 
                     history=st.session_state.messages[:-1], # Bez ostatniego pytania
-                    n_results=5
+                    n_results=5,
+                    stream=True
                 )
                 
                 for chunk in stream:
