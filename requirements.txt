@@ -8,6 +8,7 @@ yt-dlp>=2025.01.01
 openai-whisper==20231117
 faster-whisper==0.10.0
 rapidfuzz==3.6.1
+flashtext==2.7
 pyannote.audio==3.1.1
 python-dotenv==1.0.1
 watchdog==3.0.0

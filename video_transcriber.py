@@ -1,61 +1,44 @@
 import os
+import json
+import time
 import torch
 import logging
 import yt_dlp
 import warnings
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any, Optional
+from pathlib import Path
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 
 from config import ProjectConfig, logger
+from utils.memory import release_vram
 
 # Silence annoying warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 class VideoTranscriber:
     """
-    Advanced Media Transcription & Diarization Pipeline.
-    Architecture: Singleton-ready. Models are loaded on init to persist in VRAM.
+    Advanced Media Transcription & Diarization Pipeline (ETL Optimized).
+    
+    Refactored for RTX 3060 (12GB VRAM):
+    - Models are loaded ON-DEMAND only.
+    - Aggressive VRAM cleanup after transcription.
+    - Outputs raw JSON to INBOX_DIR for asynchronous processing.
     """
 
     def __init__(self, model_size: str = "medium"):
+        self.model_size = model_size
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.compute_type = "float16" if self.device == "cuda" else "int8"
         self.logger = logging.getLogger("VideoTranscriber")
         
         self.logger.info(
-            f"Initializing VideoTranscriber on {self.device} ({self.compute_type})...", 
+            f"Initialized VideoTranscriber (Stateless Mode). Device: {self.device}", 
             extra={"tags": "MEDIA-INIT"}
         )
-        
-        # 1. Load Whisper Model ONCE
-        try:
-            self.whisper_model = WhisperModel(
-                model_size, 
-                device=self.device, 
-                compute_type=self.compute_type
-            )
-            self.logger.info(f"Whisper ({model_size}) loaded into VRAM.", extra={"tags": "MODEL-LOAD"})
-        except Exception as e:
-            self.logger.error(f"Failed to load Whisper: {e}", extra={"tags": "FATAL"})
-            raise e
 
-        # 2. Pre-load Diarization Pipeline (Lazy loading optional, but strictly typed here)
-        self.diarization_pipeline = None
-        if ProjectConfig.HF_TOKEN:
-            try:
-                self.diarization_pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=ProjectConfig.HF_TOKEN
-                ).to(torch.device(self.device))
-                self.logger.info("Pyannote pipeline loaded.", extra={"tags": "MODEL-LOAD"})
-            except Exception as e:
-                self.logger.warning(f"Failed to load Pyannote: {e}. Diarization disabled.", extra={"tags": "COMPLIANCE-WARN"})
-        else:
-            self.logger.warning("No HF_TOKEN found. Diarization disabled.", extra={"tags": "CONFIG-INFO"})
-
-    def download_video(self, url: str, progress_callback=None) -> str:
-        """Downloads audio from various sources using yt-dlp."""
+    def download_video(self, url: str, progress_callback=None) -> Dict[str, Any]:
+        """Downloads audio and returns metadata dict."""
         output_dir = str(ProjectConfig.TEMP_DIR)
         out_template = os.path.join(output_dir, '%(id)s.%(ext)s')
 
@@ -81,9 +64,6 @@ class VideoTranscriber:
             'ignoreerrors': False,
             'logtostderr': False,
             'progress_hooks': [progress_hook],
-            'default_search': 'auto',
-            'source_address': '0.0.0.0',
-            # Imitate a real browser to avoid 403
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         }
 
@@ -91,62 +71,113 @@ class VideoTranscriber:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 final_path = os.path.join(output_dir, f"{info['id']}.mp3")
+                
+                metadata = {
+                    "id": info.get('id'),
+                    "title": info.get('title', 'Unknown Title'),
+                    "uploader": info.get('uploader', 'Unknown'),
+                    "duration": info.get('duration', 0),
+                    "local_path": final_path,
+                    "url": url
+                }
+                
                 self.logger.info(f"Downloaded media: {final_path}", extra={"tags": "MEDIA-DOWNLOAD"})
-                return final_path
+                return metadata
         except Exception as e:
             self.logger.error(f"Download failed: {e}", extra={"tags": "MEDIA-ERROR"})
             raise
 
-    def transcribe_and_diarize(self, audio_path: str, language: str = "pl", progress_callback=None) -> List[Dict[str, Any]]:
+    def process_to_inbox(self, url: str, progress_callback=None) -> str:
         """
-        Full Pipeline using pre-loaded models.
+        Main Pipeline: Download -> Transcribe -> Save to Inbox -> Release VRAM.
+        Returns the path to the saved JSON file.
         """
         try:
-            # 1. Transcribe (Reuse self.whisper_model)
-            self.logger.info(f"Starting transcription...", extra={"tags": "WHISPER"})
-            segments, info = self.whisper_model.transcribe(audio_path, language=language, vad_filter=True)
-            
-            transcript_segments = []
-            total_duration = info.duration
-            
-            # Whisper generator must be consumed
-            for segment in segments:
-                transcript_segments.append({
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text.strip()
-                })
-                if progress_callback and total_duration > 0:
-                    percent = int((segment.end / total_duration) * 100)
-                    progress_callback(percent)
+            # 1. Download
+            meta = self.download_video(url, progress_callback)
+            audio_path = meta['local_path']
 
-            if not self.diarization_pipeline:
-                return transcript_segments
-
-            # 2. Diarization (Reuse self.diarization_pipeline)
-            self.logger.info("Starting diarization...", extra={"tags": "PYANNOTE"})
-            diarization = self.diarization_pipeline(audio_path)
+            # 2. Transcribe (Load -> Run -> Unload)
+            transcript_data = self._run_transcription_isolated(audio_path, progress_callback)
             
-            # 3. Join logic
-            return self._merge_results(transcript_segments, diarization)
+            # 3. Construct Payload
+            payload = {
+                "meta": meta,
+                "content": transcript_data['text'],
+                "segments": transcript_data['segments'],
+                "processed_at": time.time(),
+                "status": "ready_for_refinery"
+            }
+
+            # 4. Save to INBOX
+            safe_title = "".join([c for c in meta['id'] if c.isalnum() or c in ('-','_')])
+            output_filename = f"{safe_title}.json"
+            output_path = ProjectConfig.INBOX_DIR / output_filename
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                
+            self.logger.info(f"Saved payload to Inbox: {output_path}", extra={"tags": "ETL-LOAD"})
+            return str(output_path)
 
         except Exception as e:
-            self.logger.error(f"Pipeline failed: {e}", extra={"tags": "MEDIA-ERROR"})
+            self.logger.error(f"ETL Process Failed: {e}", extra={"tags": "FATAL"})
             raise
 
-    def _merge_results(self, transcript, diarization) -> List[Dict[str, Any]]:
-        """Aligns Whisper timestamps with Pyannote speaker turns."""
-        final = []
-        for seg in transcript:
-            speaker = "Unknown"
-            max_intersection = 0
+    def _run_transcription_isolated(self, audio_path: str, progress_callback=None) -> Dict[str, Any]:
+        """
+        Runs Whisper in an isolated manner. Loads model, processes, then forces unload.
+        """
+        model = None
+        try:
+            # Ensure VRAM is clean before starting
+            release_vram()
             
-            for turn, _, label in diarization.itertracks(yield_label=True):
-                intersection = min(seg['end'], turn.end) - max(seg['start'], turn.start)
-                if intersection > max_intersection:
-                    max_intersection = intersection
-                    speaker = label
+            self.logger.info(f"Loading Whisper ({self.model_size})...", extra={"tags": "MODEL-LOAD"})
+            if progress_callback: progress_callback("Ładowanie modelu Whisper...")
             
-            seg['speaker'] = speaker
-            final.append(seg)
-        return final
+            model = WhisperModel(
+                self.model_size, 
+                device=self.device, 
+                compute_type=self.compute_type
+            )
+            
+            self.logger.info("Transcribing...", extra={"tags": "WHISPER"})
+            if progress_callback: progress_callback("Transkrypcja w toku...")
+            
+            segments_gen, info = model.transcribe(audio_path, vad_filter=True)
+            
+            segments_list = []
+            full_text_parts = []
+            
+            total_duration = info.duration
+            for segment in segments_gen:
+                text = segment.text.strip()
+                segments_list.append({
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": text
+                })
+                full_text_parts.append(text)
+                
+                # Optional visual feedback
+                if progress_callback and total_duration > 0:
+                    percent = int((segment.end / total_duration) * 100)
+                    progress_callback(f"Transkrypcja: {percent}%")
+
+            return {
+                "text": " ".join(full_text_parts),
+                "segments": segments_list
+            }
+
+        except Exception as e:
+            raise e
+        finally:
+            # CRITICAL: Clean up
+            if model:
+                del model
+            self.logger.info("Unloaded Whisper.", extra={"tags": "MODEL-UNLOAD"})
+            release_vram()
+
+    # Note: Diarization temporarily removed to focus on Whisper stability in Phase 1. 
+    # Can be re-added as a separate isolated step in _run_diarization_isolated if needed.

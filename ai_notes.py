@@ -8,12 +8,11 @@ from tqdm import tqdm
 from pathlib import Path
 
 from config import ProjectConfig, logger
-from obsidian_manager import ObsidianGardener
 
 class TranscriptProcessor:
     """
     Refactored Note Generator: Converts raw transcripts into structured technical documentation.
-    Implements Point 6 (Compliance Tagging) and Point 1 (Direct Imports).
+    Adapted for ETL: Can process text directly from memory.
     """
     
     SYSTEM_PROMPT = """
@@ -30,7 +29,6 @@ class TranscriptProcessor:
 
     def __init__(self, model: Optional[str] = None):
         self.model = model or ProjectConfig.OLLAMA_MODEL
-        self.vault_path = ProjectConfig.OBSIDIAN_VAULT
         self.logger = logging.getLogger("TranscriptProcessor")
 
     def _generate_metadata(self, text: str) -> Tuple[str, str]:
@@ -45,6 +43,8 @@ class TranscriptProcessor:
             lines = content.split('\n')
             title = lines[0].strip().replace("1. ", "").replace("Tytuł: ", "")
             summary = lines[1].strip().replace("2. ", "").replace("Podsumowanie: ", "") if len(lines) > 1 else "Brak podsumowania."
+            # Sanitize title
+            title = "".join(c for c in title if c.isalnum() or c in " -_").strip()
             return title, summary
         except Exception:
             return "Note-" + datetime.now().strftime("%Y%m%d-%H%M"), "Automatyczna notatka."
@@ -57,73 +57,68 @@ class TranscriptProcessor:
             "DORA": ["dora", "rezyliencja", "incydent", "ciągłość działania", "ict risk"],
             "NIS2": ["nis2", "infrastruktura krytyczna", "dyrektywa", "bezpieczeństwo sieci"],
             "RODO": ["rodo", "gdpr", "dane osobowe", "prywatność", "przetwarzanie"],
-            "SECURITY": ["exploit", "podatność", "cve", "pentest", "hacker"]
+            "SECURITY": ["exploit", "podatność", "cve", "pentest", "hacker"],
+            "AI": ["llm", "ai", "model", "sztuczna inteligencja", "machine learning"],
+            "PYTHON": ["python", "pip", "django", "flask", "fastapi"]
         }
         for tag, keywords in patterns.items():
             if any(kw in text_lower for kw in keywords):
                 tags.append(tag)
         return tags or ["GENERAL"]
 
-    def generate_note_content(self, transcript_file: str) -> Dict[str, Any]:
-        """Main pipeline to generate note structure."""
-        path = Path(transcript_file)
-        if not path.exists(): return {"error": "File not found"}
+    def generate_note_content_from_text(self, text: str, meta: Dict[str, Any] = None, style: str = "Academic") -> Dict[str, Any]:
+        """
+        Direct generation from text string (Refinery Phase).
+        """
+        if not text:
+            return {"title": "Empty Note", "content": "", "tags": []}
 
-        raw_text = path.read_text(encoding='utf-8')
-        title, summary = self._generate_metadata(raw_text)
+        # 1. Metadata
+        title, summary = self._generate_metadata(text)
+        if meta and meta.get('title') and meta.get('title') != "Unknown Title":
+             # Prefer metadata title but sanitize it
+             title = "".join(c for c in meta['title'] if c.isalnum() or c in " -_").strip()
+
+        # 2. Context Chunking
+        chunks = [text[i:i+6000] for i in range(0, len(text), 5000)]
+        full_body = []
+
+        # Adjust system prompt based on style
+        style_instruction = ""
+        if style == "Bullet Points": style_instruction = "Używaj głównie list wypunktowanych."
+        if style == "Summary": style_instruction = "Skup się tylko na najważniejszych wnioskach."
         
-        # Simple chunking for LLM context window
-        chunks = [raw_text[i:i+5000] for i in range(0, len(raw_text), 4500)]
-        full_markdown = []
+        system_prompt = self.SYSTEM_PROMPT + f"\nSTYL: {style_instruction}"
 
-        for i, chunk in enumerate(tqdm(chunks, desc="Generating Note Content")):
+        for i, chunk in enumerate(tqdm(chunks, desc="Refining Content")):
             try:
                 resp = ollama.chat(
                     model=self.model,
                     messages=[
-                        {'role': 'system', 'content': self.SYSTEM_PROMPT},
-                        {'role': 'user', 'content': f"Przetwórz fragment {i+1}:\n{chunk}"}
+                        {'role': 'system', 'content': system_prompt},
+                        {'role': 'user', 'content': f"Przetwórz fragment {i+1} (zachowaj ciągłość):\n{chunk}"}
                     ]
                 )
-                full_markdown.append(resp['message']['content'])
+                full_body.append(resp['message']['content'])
             except Exception as e:
-                self.logger.error(f"Chunk processing failed: {e}")
+                self.logger.error(f"Chunk error: {e}")
 
-        combined_content = "\n\n".join(full_markdown)
-        compliance = self._detect_compliance_tags(combined_content)
+        combined_body = "\n\n".join(full_body)
         
-        # Metadata construction
-        header = f"""
----
-created: {datetime.now().strftime("%Y-%m-%d %H:%M")}
-tags: [auto-generated, {", ".join(compliance).lower()}]
-compliance: {compliance}
-status: to-review
----
+        # 3. Tagging
+        tags = self._detect_compliance_tags(combined_body)
+        if meta:
+            tags.append(f"source/{meta.get('uploader', 'unknown').lower().replace(' ', '_')}")
 
-# {title}
-
-> **Summary:** {summary}
-
----
-"""
         return {
-            "title": "".join(c for c in title if c.isalnum() or c in " -_").strip(),
-            "content": header + combined_content,
-            "tags": compliance # Compatibility with app.py UI
+            "title": title,
+            "content": combined_body, # Raw markdown body, header will be added by Gardener
+            "summary": summary,
+            "tags": tags
         }
 
-    def save_note_to_disk(self, title: str, content: str) -> str:
-        """Saves note and triggers Gardener for auto-linking."""
-        safe_title = title.replace(" ", "-").lower()
-        filename = f"{datetime.now().strftime('%Y-%m-%d')}-{safe_title}.md"
-        file_path = self.vault_path / filename
-        
-        file_path.write_text(content, encoding='utf-8')
-        self.logger.info(f"Saved note: {file_path}", extra={"tags": "NOTE-SAVE"})
-        
-        # Trigger Gardener
-        gardener = ObsidianGardener()
-        gardener.process_file(str(file_path))
-        
-        return str(file_path)
+    # Legacy wrapper for compatibility if needed, but App uses the method above now
+    def generate_note_content(self, transcript_file: str) -> Dict[str, Any]:
+        path = Path(transcript_file)
+        if not path.exists(): return {"error": "File not found"}
+        return self.generate_note_content_from_text(path.read_text(encoding='utf-8'))

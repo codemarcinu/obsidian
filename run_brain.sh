@@ -42,8 +42,13 @@ echo -e "${BLUE}[3/6]${NC} Weryfikacja bibliotek (może to chwilę potrwać)..."
 pip install -r requirements.txt | grep -v "already satisfied" || true
 echo -e "${GREEN}      Biblioteki sprawdzone.${NC}"
 
-# 4. Sprawdzenie konfiguracji
-echo -e "${BLUE}[4/6]${NC} Sprawdzanie pliku .env i ścieżek..."
+# 4. Sprawdzenie konfiguracji i czyszczenie
+echo -e "${BLUE}[4/6]${NC} Przygotowanie środowiska (czyszczenie temp)..."
+mkdir -p obsidian_db/_INBOX
+mkdir -p temp_processing
+# Usuwanie plików starszych niż 24h z temp
+find temp_processing -type f -mmin +1440 -delete 2>/dev/null || true
+
 if [ ! -f ".env" ]; then
     echo -e "${YELLOW}      UWAGA: Brak pliku .env. Uruchamiam z domyślnymi ustawieniami.${NC}"
 else

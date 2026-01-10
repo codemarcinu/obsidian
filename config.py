@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # Paths
     OBSIDIAN_VAULT: Path = Field(default=BASE_DIR / "Education")
     CHROMA_DB_DIR: Path = Field(default=BASE_DIR / "obsidian_db")
+    INBOX_DIR: Path = Field(default=BASE_DIR / "obsidian_db" / "_INBOX")
     TEMP_DIR: Path = Field(default=BASE_DIR / "temp_processing")
 
     # LLM Settings (Ollama)
@@ -44,6 +45,7 @@ class Settings(BaseSettings):
         """Ensures critical directories exist."""
         self.OBSIDIAN_VAULT.mkdir(parents=True, exist_ok=True)
         self.CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+        self.INBOX_DIR.mkdir(parents=True, exist_ok=True)
         self.TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     def setup_logging(self):

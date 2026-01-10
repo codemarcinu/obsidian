@@ -1,280 +1,186 @@
 import streamlit as st
 import os
+import json
 import time
 import logging
 from pathlib import Path
-import ollama
+from typing import List
 
 # --- CONFIG ---
 from config import ProjectConfig, logger
 
 # --- MODULES ---
-from ai_notes import TranscriptProcessor
-from rag_engine import ObsidianRAG
+# Ingest Modules
 from video_transcriber import VideoTranscriber
-from news_agent import NewsAgent
-from ai_research import WebResearcher
-from pdf_shredder import PDFShredder
+# Refinery Modules
+from ai_notes import TranscriptProcessor
+from obsidian_manager import ObsidianGardener
 
-st.set_page_config(page_title="Obsidian AI Bridge v3.0", layout="wide", page_icon="🧠")
+# Initialize Page
+st.set_page_config(page_title="Obsidian AI Bridge v4.0 (ETL)", layout="wide", page_icon="⚡")
 
-# --- RESOURCE CACHING (The "Anti-Shell-Hell" Layer) ---
+# --- UTILS ---
 
-@st.cache_resource(show_spinner="Ładowanie silnika RAG...")
-def get_rag_engine():
-    """Singleton for Vector DB connection."""
-    return ObsidianRAG()
+def load_inbox_items() -> List[Path]:
+    """Scans INBOX_DIR for ready JSON files."""
+    if not ProjectConfig.INBOX_DIR.exists():
+        return []
+    # Sort by modification time (newest first)
+    files = list(ProjectConfig.INBOX_DIR.glob("*.json"))
+    files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return files
 
-@st.cache_resource(show_spinner="Ładowanie modeli AI do VRAM (Whisper+Pyannote)...")
-def get_transcriber():
-    """Singleton for GPU-heavy models. Loaded ONCE."""
-    return VideoTranscriber(model_size="medium")
-
-@st.cache_data(ttl=300)
-def get_vault_stats():
-    """Cached vault statistics."""
-    vault = ProjectConfig.OBSIDIAN_VAULT
-    md_files = list(vault.rglob("*.md"))
-    return len(md_files)
-
-def check_system_health():
-    health = {"ollama": False, "gpu": False}
+def get_file_summary(path: Path) -> dict:
+    """Reads metadata from JSON safely."""
     try:
-        ollama.list()
-        health["ollama"] = True
-    except: pass
-    try:
-        import torch
-        if torch.cuda.is_available(): health["gpu"] = True
-    except: pass
-    return health
-
-# --- SESSION STATE INIT ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        meta = data.get('meta', {})
+        return {
+            "title": meta.get('title', path.stem),
+            "date": time.strftime('%Y-%m-%d %H:%M', time.localtime(data.get('processed_at', 0))),
+            "path": path,
+            "data": data
+        }
+    except Exception:
+        return {"title": "Corrupted File", "path": path, "data": None}
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.title("🧠 Second Brain")
-    st.caption("v3.0 • Module-Based Architecture")
-    st.divider()
-    
-    mode = st.radio(
-        "Nawigacja:",
-        [
-            "🏠 Dashboard",
-            "📥 Import: Wideo/Audio",
-            "🌐 Research & News",
-            "📄 Import: PDF Compliance",
-            "🔎 RAG Chat (Baza Wiedzy)",
-            "⚙️ Debug / Config"
-        ]
-    )
+    st.title("⚡ AI Second Brain")
+    st.caption("v4.0 • Async ETL Architecture")
+    st.info("System optimizes VRAM usage by separating Ingestion (Whisper) from Refinery (LLM).")
     
     st.divider()
-    st.info(f"Vault: `{ProjectConfig.OBSIDIAN_VAULT.name}`")
-    st.info(f"Model: `{ProjectConfig.OLLAMA_MODEL}`")
+    st.markdown("### 📊 Queue Status")
+    inbox_files = load_inbox_items()
+    st.metric("Inbox Queue", len(inbox_files))
 
-# --- MAIN PAGES ---
+# --- TABS ---
+tab_ingest, tab_refinery, tab_rag, tab_debug = st.tabs([
+    "📥 Ingest (Download & Transcribe)", 
+    "🏭 Refinery (LLM & Obsidian)",
+    "🔎 Knowledge Base",
+    "⚙️ System"
+])
 
-if mode == "🏠 Dashboard":
-    st.title("Centrum Dowodzenia")
-    
-    health = check_system_health()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Notatki w Bazie", get_vault_stats())
-    with c2:
-        st.metric("AI Model", "Online" if health["ollama"] else "Offline", delta_color="normal")
-    with c3:
-        st.metric("GPU Status", "RTX 3060 Ready" if health["gpu"] else "CPU Only")
-
-    st.markdown("### ⚡ Quick Actions")
-    if st.button("🧹 Wyczyść Cache (Reload Models)"):
-        st.cache_resource.clear()
-        st.rerun()
-
-elif mode == "📥 Import: Wideo/Audio":
-    st.header("🎥 Media Ingestion (GPU Optimized)")
+# ==============================================================================
+# TAB 1: INGEST (Extract)
+# Goal: Download -> Transcribe -> Save JSON to Inbox -> Release VRAM
+# ==============================================================================
+with tab_ingest:
+    st.header("1. Media Ingestion")
+    st.markdown("Pobierz i przetwórz audio na tekst. Wynik trafi do `Inbox`.")
     
     col1, col2 = st.columns([2, 1])
     with col1:
-        video_url = st.text_input("YouTube URL:")
-        uploaded_file = st.file_uploader("Lub plik lokalny (MP3/MP4/WAV):")
+        video_url = st.text_input("YouTube URL:", placeholder="https://youtube.com/watch?v=...")
     with col2:
-        st.markdown("**Konfiguracja:**")
-        do_diarization = st.checkbox("Rozpoznawanie mówców (Pyannote)", value=True)
-        # Note: Model size is fixed in singleton for performance, but could be parameterised with different singletons
+        model_size = st.selectbox("Model Whisper", ["base", "small", "medium", "large-v3"], index=2)
 
-    if st.button("🚀 Przetwórz Media", type="primary"):
-        status_container = st.status("Inicjalizacja...", expanded=True)
-        progress_bar = status_container.empty()
-        
-        with status_container:
-            try:
-                # 1. Get Singleton
-                transcriber = get_transcriber()
-                
-                # 2. Acquire File
-                target_file = None
-                
-                def download_callback(msg):
-                    status_container.update(label=f"📥 {msg}", state="running")
-                
-                if video_url:
-                    target_file = transcriber.download_video(video_url, progress_callback=download_callback)
-                elif uploaded_file:
-                    status_container.write("📥 Wczytywanie pliku lokalnego...")
-                    target_file = ProjectConfig.TEMP_DIR / uploaded_file.name
-                    with open(target_file, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    target_file = str(target_file)
-                
-                if target_file:
-                    st.audio(target_file)
-                    
-                    # 3. Transcribe
-                    status_container.update(label="📝 Transkrypcja (Whisper)...", state="running")
-                    
-                    def transcribe_callback(percent):
-                        progress_bar.progress(percent, text=f"Transkrypcja: {percent}%")
-                    
-                    segments = transcriber.transcribe_and_diarize(target_file, progress_callback=transcribe_callback)
-                    progress_bar.empty() # Clear progress bar
-                    
-                    # 4. Format
-                    full_text = ""
-                    for seg in segments:
-                        speaker = f"[{seg.get('speaker', '?')}]: " if 'speaker' in seg else ""
-                        full_text += f"{speaker}{seg['text']}\n"
-                    
-                    # 5. Save Raw
-                    raw_path = str(target_file) + ".txt"
-                    with open(raw_path, "w", encoding='utf-8') as f:
-                        f.write(full_text)
-                        
-                    # 6. Generate Note
-                    status_container.update(label="🧠 Analiza treści (Ollama)...", state="running")
-                    processor = TranscriptProcessor() # Lightweight, no caching needed
-                    note_data = processor.generate_note_content(raw_path)
-                    
-                    st.session_state['draft_note'] = note_data
-                    status_container.update(label="✅ Gotowe!", state="complete")
-                    
-            except Exception as e:
-                status_container.update(label="❌ Błąd krytyczny!", state="error")
-                st.error(f"Error: {e}")
-                logger.error(f"Ingestion Error: {e}")
+    if st.button("🚀 Start Extraction Process", type="primary", use_container_width=True):
+        if not video_url:
+            st.error("Podaj URL!")
+            st.stop()
 
-    # Editor UI
-    if 'draft_note' in st.session_state:
-        draft = st.session_state['draft_note']
-        st.divider()
-        st.subheader(f"Edycja: {draft.get('title', 'Untitled')}")
-        edited_content = st.text_area("Treść", draft.get('content', ''), height=400)
+        status = st.status("Initializing Ingestion Pipeline...", expanded=True)
+        progress = status.empty()
         
-        if st.button("💾 Zapisz Notatkę"):
-            processor = TranscriptProcessor()
-            # Note: We need to parse title from content or input, simple way:
-            final_path = processor.save_note_to_disk(draft.get('title', 'note'), edited_content)
-            st.success(f"Zapisano: {final_path}")
-            del st.session_state['draft_note']
-            time.sleep(1)
+        try:
+            # Initialize Transcriber (Stateless)
+            transcriber = VideoTranscriber(model_size=model_size)
+            
+            def update_progress(msg):
+                status.write(f"🔄 {msg}")
+            
+            # Run Process
+            json_path = transcriber.process_to_inbox(video_url, progress_callback=update_progress)
+            
+            status.update(label="✅ Extraction Complete!", state="complete", expanded=False)
+            st.success(f"Saved payload to Inbox: `{Path(json_path).name}`")
+            st.balloons()
+            time.sleep(2)
             st.rerun()
-
-elif mode == "🌐 Research & News":
-    st.header("🌐 AI Researcher")
-    tab1, tab2 = st.tabs(["Web Analyzer", "RSS News Agent"])
-    
-    with tab1:
-        url = st.text_input("URL artykułu:")
-        if st.button("Analizuj"):
-            researcher = WebResearcher()
-            with st.spinner("Czytanie i analiza..."):
-                if researcher.process_url(url):
-                    st.success("Notatka dodana do Research!")
-                else:
-                    st.error("Błąd pobierania.")
-    
-    with tab2:
-        if st.button("Pobierz Newsy"):
-            agent = NewsAgent()
-            with st.spinner("Skanowanie feedów..."):
-                count = agent.run()
-            st.success(f"Dodano {count} nowych newsów.")
-
-elif mode == "📄 Import: PDF Compliance":
-    st.header("📄 PDF Shredder")
-    uploaded = st.file_uploader("Wybierz PDF", type="pdf")
-    if uploaded and st.button("Przetwórz"):
-        temp_path = ProjectConfig.TEMP_DIR / uploaded.name
-        with open(temp_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-        
-        shredder = PDFShredder()
-        success, msg = shredder.process_pdf(str(temp_path))
-        if success:
-            st.success(f"Raport gotowy: {Path(msg).name}")
-        else:
-            st.error(msg)
-
-elif mode == "🔎 RAG Chat (Baza Wiedzy)":
-    st.header("🔎 Chat z Dokumentacją")
-    
-    # Singleton RAG Engine
-    rag = get_rag_engine()
-    
-    c1, c2 = st.columns([3, 1])
-    with c2:
-        if st.button("🔄 Re-indeksacja"):
-            with st.status("Indeksowanie..."):
-                count = rag.index_vault(ProjectConfig.OBSIDIAN_VAULT)
-                st.write(f"Zindeksowano: {count} nowych chunków.")
-    
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
             
-    if prompt := st.chat_input():
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-            
-        with st.chat_message("assistant"):
-            response_container = st.empty()
-            full_response = ""
-            for chunk in rag.query(prompt, history=st.session_state.messages):
-                full_response += chunk
-                response_container.markdown(full_response + "▌")
-            response_container.markdown(full_response)
-        
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        except Exception as e:
+            status.update(label="❌ Critical Error", state="error")
+            st.error(str(e))
+            logger.error(f"Ingest Error: {e}")
 
-elif mode == "⚙️ Debug / Config":
-    st.header("Konfiguracja i Logi")
+# ==============================================================================
+# TAB 2: REFINERY (Transform & Load)
+# Goal: Load JSON -> Generate Note (LLM) -> Link (FlashText) -> Save to Vault
+# ==============================================================================
+with tab_refinery:
+    st.header("2. Knowledge Refinery")
     
-    tab_cfg, tab_log = st.tabs(["⚙️ Konfiguracja", "📝 Logi Systemowe"])
-    
-    with tab_cfg:
-        st.json(ProjectConfig.model_dump())
-    
-    with tab_log:
-        log_file = ProjectConfig.BASE_DIR / "system.log"
-        col1, col2 = st.columns([4, 1])
-        with col2:
-            if st.button("🔄 Odśwież"):
-                st.rerun()
-            if st.button("🗑️ Wyczyść Logi"):
-                if log_file.exists():
-                    log_file.write_text("")
-                    st.success("Logi wyczyszczone.")
-                    st.rerun()
+    if not inbox_files:
+        st.info("Inbox is empty. Go to Ingest tab to add content.")
+    else:
+        # Selection Logic
+        file_options = {f.name: f for f in inbox_files}
+        selected_file_name = st.selectbox(
+            "Select Item from Inbox:", 
+            options=list(file_options.keys()),
+            format_func=lambda x: f"📄 {x}"
+        )
         
-        if log_file.exists():
-            with open(log_file, "r", encoding='utf-8') as f:
-                lines = f.readlines()
-                # Odwracamy kolejność, żeby najnowsze były na górze
-                last_logs = "".join(reversed(lines[-500:]))
-                st.code(last_logs, language="log")
-        else:
-            st.warning("Plik system.log nie istnieje.")
+        selected_path = file_options[selected_file_name]
+        summary = get_file_summary(selected_path)
+        data = summary['data']
+
+        if data:
+            st.divider()
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.subheader(summary['title'])
+                st.caption(f"Processed: {summary['date']}")
+                st.text_area("Raw Transcript (Preview)", data.get('content', '')[:1000]+"...", height=200, disabled=True)
+            
+            with c2:
+                st.markdown("### AI Configuration")
+                prompt_style = st.selectbox("Note Style", ["Academic", "Blog Post", "Bullet Points", "Summary"])
+                
+                if st.button("🧠 Generate Obsidian Note", type="primary"):
+                    with st.spinner("Loading LLM & Generating..."):
+                        try:
+                            # 1. Generate Content (LLM)
+                            processor = TranscriptProcessor()
+                            note_content = processor.generate_note_content_from_text(
+                                text=data.get('content', ''), 
+                                meta=data.get('meta', {}),
+                                style=prompt_style
+                            )
+                            
+                            # 2. Smart Linking & Tagging (FlashText)
+                            gardener = ObsidianGardener()
+                            final_note = gardener.auto_link(note_content['content'])
+                            final_tags = gardener.smart_tagging(note_content.get('tags', []))
+                            
+                            # 3. Save to Vault
+                            saved_path = gardener.save_note(
+                                title=note_content.get('title', summary['title']),
+                                content=final_note,
+                                tags=final_tags
+                            )
+                            
+                            # 4. Archive Inbox Item
+                            archive_dir = ProjectConfig.INBOX_DIR / "archive"
+                            archive_dir.mkdir(exist_ok=True)
+                            selected_path.rename(archive_dir / selected_path.name)
+                            
+                            st.success(f"Note created: `{saved_path.name}`")
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"Refinery Error: {e}")
+
+# ==============================================================================
+# TAB 3 & 4: Placeholders for RAG & Config (Simplified for Phase 3)
+# ==============================================================================
+with tab_rag:
+    st.info("RAG Engine will be re-connected in future updates.")
+
+with tab_debug:
+    st.write("System Config:")
+    st.json(ProjectConfig.model_dump())

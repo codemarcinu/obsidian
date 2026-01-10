@@ -18,4 +18,5 @@ processed_news.json
 Thumbs.db
 
 # Tymczasowe
+temp_processing/
 tmp/temp_processing/
