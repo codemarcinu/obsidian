@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     
     # External APIs
     HF_TOKEN: Optional[str] = None
+    GOOGLE_APPLICATION_CREDENTIALS: Optional[Path] = Field(default=BASE_DIR / "gcp_key.json")
 
     # RAG Settings
     RAG_CHUNK_SIZE: int = Field(default=1000)

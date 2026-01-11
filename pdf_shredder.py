@@ -1,4 +1,5 @@
 import os
+import io
 import logging
 import pdfplumber
 import ollama
@@ -7,6 +8,7 @@ import shutil
 from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
 from datetime import datetime
+from google.cloud import vision
 
 from config import ProjectConfig, logger
 from obsidian_manager import ObsidianGardener
@@ -31,6 +33,14 @@ class PDFShredder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("PDFShredder")
 
+        # Google Vision Setup
+        if ProjectConfig.GOOGLE_APPLICATION_CREDENTIALS and ProjectConfig.GOOGLE_APPLICATION_CREDENTIALS.exists():
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(ProjectConfig.GOOGLE_APPLICATION_CREDENTIALS)
+            self.vision_client = vision.ImageAnnotatorClient()
+        else:
+            self.vision_client = None
+            self.logger.warning("Google Vision credentials not found. OCR will be disabled.")
+
     def detect_compliance_tags(self, text: str) -> List[str]:
         """Automated Compliance Tagging (Point 6 of Audit)."""
         tags = []
@@ -39,6 +49,38 @@ class PDFShredder:
             if any(kw.lower() in text_lower for kw in keywords):
                 tags.append(tag)
         return tags if tags else ["General"]
+
+    def ocr_pdf_fallback(self, pdf_path: str) -> str:
+        """OCR fallback using Google Vision for PDF files with no text layer."""
+        if not self.vision_client:
+            return ""
+        
+        self.logger.info(f"PDF has no text layer or very little text. Attempting Google Vision OCR: {pdf_path}")
+        try:
+            with open(pdf_path, 'rb') as f:
+                content = f.read()
+            
+            input_config = vision.InputConfig(content=content, mime_type='application/pdf')
+            feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+            
+            # Process the first few pages
+            request = vision.AnnotateFileRequest(
+                input_config=input_config,
+                features=[feature],
+                pages=[1, 2, 3] 
+            )
+            
+            response = self.vision_client.batch_annotate_files(requests=[request])
+            
+            texts = []
+            for page_response in response.responses[0].responses:
+                if page_response.full_text_annotation.text:
+                    texts.append(page_response.full_text_annotation.text)
+            
+            return "\n".join(texts)
+        except Exception as e:
+            self.logger.error(f"OCR Fallback failed: {e}")
+            return ""
 
     def extract_content(self, pdf_path: str) -> Tuple[str, List[str]]:
         """Extracts text and identifies compliance scope."""
@@ -59,9 +101,16 @@ class PDFShredder:
                             full_text.append("|" + "---|" * len(table[0]))
         except Exception as e:
             self.logger.error(f"Error reading PDF {pdf_path}: {e}")
-            return "", []
 
-        combined_text = "\n".join(full_text)
+        combined_text = "\n".join(full_text).strip()
+        
+        # Fallback to Google Vision if no text was extracted or content is too short (possible scan)
+        if not combined_text or len(combined_text) < 100:
+            ocr_text = self.ocr_pdf_fallback(pdf_path)
+            if ocr_text:
+                combined_text = ocr_text
+                self.logger.info("Successfully recovered text via Google Vision OCR.")
+
         tags = self.detect_compliance_tags(combined_text)
         return combined_text, tags
 
@@ -140,6 +189,79 @@ class PDFShredder:
         gardener.process_file(final_path)
         
         return True, str(final_path)
+
+    def process_image(self, image_path: str) -> Tuple[bool, str]:
+        """Pipeline for Image ingestion (OCR + Labeling)."""
+        self.logger.info(f"Processing Image: {image_path}")
+        
+        if not self.vision_client:
+            return False, "Google Vision not configured."
+
+        try:
+            with open(image_path, 'rb') as f:
+                content = f.read()
+
+            image = vision.Image(content=content)
+            
+            # Perform Label Detection and Text Detection
+            features = [
+                vision.Feature(type_=vision.Feature.Type.LABEL_DETECTION),
+                vision.Feature(type_=vision.Feature.Type.TEXT_DETECTION),
+            ]
+            request = vision.AnnotateImageRequest(image=image, features=features)
+            response = self.vision_client.batch_annotate_images(requests=[request])
+            
+            result = response.responses[0]
+            
+            # Extract Text
+            text_content = result.full_text_annotation.text if result.full_text_annotation else ""
+            
+            # Extract Labels
+            labels = [label.description for label in result.label_annotations]
+            
+            # Combine for analysis
+            analysis_content = f"Labels: {', '.join(labels)}\n\nText Content:\n{text_content}"
+            
+            # 1. Smart Renaming & Categorization
+            tags = self.detect_compliance_tags(text_content)
+            tags.append("VisualNote")
+            
+            new_filename = self.suggest_filename(analysis_content)
+            
+            # 2. Extract Home Data if applicable
+            home_data = {}
+            if "FINANSE" in tags or "ZDROWIE" in tags:
+                home_data = self.extract_home_data(text_content)
+
+            # 3. Copy image to Vault Assets
+            assets_dir = self.vault_path / "Assets"
+            assets_dir.mkdir(exist_ok=True)
+            image_ext = Path(image_path).suffix
+            saved_image_name = f"{new_filename}{image_ext}"
+            shutil.copy2(image_path, assets_dir / saved_image_name)
+            
+            # 4. Save structured note
+            final_path = self.save_as_note(new_filename, text_content, tags, home_data)
+            
+            # Embed image in note
+            with open(final_path, 'r+') as f:
+                content = f.read()
+                f.seek(0, 0)
+                f.write(f"![[{saved_image_name}]]\n\n" + content)
+                
+                # Append Image Analysis info
+                f.seek(0, 2) # End of file
+                f.write(f"\n\n## Visual Analysis\n**Detected Objects:** {', '.join(labels)}\n")
+
+            # 5. Auto-linking via Gardener
+            gardener = ObsidianGardener(str(self.vault_path))
+            gardener.process_file(final_path)
+            
+            return True, str(final_path)
+
+        except Exception as e:
+            self.logger.error(f"Image processing failed: {e}")
+            return False, str(e)
 
     def save_as_note(self, title: str, content: str, tags: List[str], home_data: Dict[str, Any] = None) -> Path:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")

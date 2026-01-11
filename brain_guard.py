@@ -21,6 +21,7 @@ from ai_research import WebResearcher
 from ai_notes import TranscriptProcessor
 from obsidian_manager import ObsidianGardener
 from utils.life_admin import process_voice_note_for_life
+from pdf_shredder import PDFShredder
 
 def send_windows_notification(title, message):
     """Sends a toast notification to Windows via WSL PowerShell."""
@@ -53,11 +54,22 @@ class BrainGuardHandler(FileSystemEventHandler):
         self.processor = TranscriptProcessor()
         self.gardener = ObsidianGardener()
         self.researcher = WebResearcher(gardener=self.gardener)
-        self.supported_extensions = {'.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', '.md'}
+        self.shredder = PDFShredder(vault_path=str(ProjectConfig.OBSIDIAN_VAULT))
+        
+        self.supported_extensions = {
+            # Audio/Video
+            '.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', 
+            # Text/Notes
+            '.md',
+            # Documents
+            '.pdf',
+            # Images
+            '.jpg', '.jpeg', '.png', '.webp'
+        }
         self.queue_filename = "youtube_queue.md"
         self.article_queue_filename = "reading_list.md"
         self.processing_queue = False
-        logger.info("BrainGuard initialized and ready to protect (Media + Notes).")
+        logger.info("BrainGuard initialized and ready to protect (Media + Notes + Docs + Images).")
 
     def _extract_tasks(self, text: str) -> list[str]:
         """
@@ -484,6 +496,19 @@ class BrainGuardHandler(FileSystemEventHandler):
             return p
         return None
 
+    def _archive_file(self, file_path: Path):
+        """Moves a processed file to the Archive folder."""
+        inbox_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox"
+        archive_dir = inbox_dir / "Archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            target_path = archive_dir / file_path.name
+            shutil.move(file_path, target_path)
+            logger.info(f"Archived file to: {target_path}")
+        except Exception as e:
+            logger.warning(f"Could not archive file {file_path.name}: {e}")
+
     def process_file(self, file_path: Path):
         """
         Orchestrates the processing pipeline.
@@ -493,7 +518,29 @@ class BrainGuardHandler(FileSystemEventHandler):
             time.sleep(2) 
             
             logger.info(f"Starting processing for: {file_path.name}")
+            ext = file_path.suffix.lower()
 
+            # --- PDF Handling ---
+            if ext == '.pdf':
+                success, note_path = self.shredder.process_pdf(str(file_path))
+                if success:
+                    self._archive_file(file_path)
+                    send_windows_notification("BrainGuard", f"PDF Processed: {file_path.name}")
+                else:
+                    logger.error(f"Failed to process PDF: {note_path}")
+                return
+
+            # --- Image Handling ---
+            if ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                success, note_path = self.shredder.process_image(str(file_path))
+                if success:
+                    self._archive_file(file_path)
+                    send_windows_notification("BrainGuard", f"Image Processed: {file_path.name}")
+                else:
+                    logger.error(f"Failed to process Image: {note_path}")
+                return
+
+            # --- Audio/Video Handling ---
             # 1. Transcribe
             json_path = self.transcriber.process_local_file(str(file_path))
             
@@ -535,14 +582,8 @@ class BrainGuardHandler(FileSystemEventHandler):
             # [UX] Notification
             send_windows_notification("BrainGuard", f"Gotowe: {note_data['title']}")
 
-            # 5. Archive Source Audio in 00_Inbox/Archive (regardless of target category)
-            inbox_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox"
-            archive_dir = inbox_dir / "Archive"
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            
-            source_archive_path = archive_dir / file_path.name
-            shutil.move(file_path, source_archive_path)
-            logger.info(f"Archived source audio to: {source_archive_path}")
+            # 5. Archive Source Audio
+            self._archive_file(file_path)
 
             # 6. Update Daily Log (Optional - keeping it for history)
             try:

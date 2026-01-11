@@ -20,3 +20,4 @@ Thumbs.db
 # Tymczasowe
 temp_processing/
 tmp/temp_processing/
+gcp_key.json
