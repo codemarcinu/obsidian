@@ -66,7 +66,7 @@ def get_file_summary(path: Path) -> dict:
     except Exception:
         return {"title": "Uszkodzony Plik", "path": path, "data": None}
 
-def process_single_file(file_path: Path, style="Academic"):
+def process_single_file(file_path: Path, style="Academic", gardener_instance=None):
     """Logic extracted for batch processing."""
     summary = get_file_summary(file_path)
     data = summary['data']
@@ -89,7 +89,7 @@ def process_single_file(file_path: Path, style="Academic"):
     )
     
     # 2. Smart Linking & Tagging (FlashText)
-    gardener = ObsidianGardener()
+    gardener = gardener_instance or ObsidianGardener()
     final_note = gardener.auto_link(note_content['content'])
     final_tags = gardener.smart_tagging(note_content.get('tags', []))
     
@@ -256,10 +256,13 @@ elif selected_page == "🏭 Przetwarzanie (Refinery)":
             progress_bar = st.progress(0)
             status_text = st.empty()
             
+            # Initialize gardener once for the whole batch
+            batch_gardener = ObsidianGardener()
+            
             for i, file_path in enumerate(inbox_files):
                 status_text.text(f"Przetwarzanie: {file_path.name}...")
                 try:
-                    process_single_file(file_path, style="Summary")
+                    process_single_file(file_path, style="Summary", gardener_instance=batch_gardener)
                 except Exception as e:
                     st.error(f"Błąd przy {file_path.name}: {e}")
                 

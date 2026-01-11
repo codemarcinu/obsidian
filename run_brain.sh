@@ -60,6 +60,27 @@ echo -e "${BLUE}[5/6]${NC} Sprawdzanie modelu AI (Ollama)..."
 python3 check_ollama.py
 echo -e "${GREEN}      Gotowe.${NC}"
 
+# --- URUCHOMIENIE BRAIN GUARD W TLE ---
+echo -e "${BLUE}[+]${NC} Uruchamianie Strażnika (BrainGuard)..."
+
+# Funkcja czyszcząca - zabija procesy w tle przy wyjściu (Ctrl+C)
+cleanup() {
+    echo -e "\n${YELLOW}Zamykanie systemu...${NC}"
+    if [ ! -z "$GUARD_PID" ]; then
+        echo "Zabijanie procesu Strażnika (PID: $GUARD_PID)..."
+        kill $GUARD_PID
+    fi
+    exit
+}
+
+# Rejestracja sygnału wyjścia
+trap cleanup SIGINT SIGTERM
+
+# Start Strażnika w tle, logi idą do pliku
+python3 -u brain_guard.py > brain_guard_runtime.log 2>&1 &
+GUARD_PID=$!
+echo -e "${GREEN}      Strażnik działa w tle (PID: $GUARD_PID).${NC}"
+
 # 6. Start aplikacji
 echo -e "${BLUE}[6/6]${NC} Uruchamianie interfejsu Streamlit..."
 echo -e "${YELLOW}----------------------------------------------------------${NC}"

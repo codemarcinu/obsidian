@@ -29,11 +29,12 @@ class WebResearcher:
     3. Pomiń zbędne informacje (reklamy, wstępy).
     """
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, gardener: Optional[ObsidianGardener] = None):
         self.vault_path = ProjectConfig.OBSIDIAN_VAULT
         self.model = model or ProjectConfig.OLLAMA_MODEL
         self.output_dir = self.vault_path / "Research"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.gardener = gardener or ObsidianGardener()
 
     @staticmethod
     def clean_filename(title: str) -> str:
@@ -114,6 +115,5 @@ status: to-read
         logger.info(f"Research saved: {filepath}", extra={"tags": "NOTE-SAVE"})
         
         # Auto-link concepts
-        gardener = ObsidianGardener()
-        gardener.process_file(str(filepath))
+        self.gardener.process_file(str(filepath))
         return True

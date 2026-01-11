@@ -52,7 +52,7 @@ class BrainGuardHandler(FileSystemEventHandler):
         self.transcriber = VideoTranscriber(model_size="medium") # Use medium for better accuracy
         self.processor = TranscriptProcessor()
         self.gardener = ObsidianGardener()
-        self.researcher = WebResearcher()
+        self.researcher = WebResearcher(gardener=self.gardener)
         self.supported_extensions = {'.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', '.md'}
         self.queue_filename = "youtube_queue.md"
         self.article_queue_filename = "reading_list.md"
@@ -221,7 +221,7 @@ class BrainGuardHandler(FileSystemEventHandler):
                         f.writelines(lines)
                     
                     # Extract URL
-                    url_match = re.search(r'(https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+))', line_stripped)
+                    url_match = re.search(r'(https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|live/|embed/)|youtu\.be/)([\w-]+))', line_stripped)
                     if not url_match:
                         lines[i] = line.rstrip() + " ❌ [Błąd: Niepoprawny URL]\n"
                         with open(file_path, 'w', encoding='utf-8') as f:
@@ -283,6 +283,11 @@ class BrainGuardHandler(FileSystemEventHandler):
 
     def process_markdown_file(self, file_path: Path):
         """Processes a markdown file looking for audio attachments OR URLs."""
+        # EXCEPTION: Do not refine queue files as regular notes!
+        if file_path.name in [self.queue_filename, self.article_queue_filename]:
+            logger.info(f"Skipping refinement for queue file: {file_path.name}")
+            return
+
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -290,7 +295,7 @@ class BrainGuardHandler(FileSystemEventHandler):
             # Pattern for ![[Recording 2026... .m4a]]
             audio_pattern = r'!\[\[(.*?\.(mp3|wav|m4a|ogg|mp4))\]\]'
             # Pattern for YouTube URLs
-            url_pattern = r'(https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+))'
+            url_pattern = r'(https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|live/|embed/)|youtu\.be/)([\w-]+))'
             
             audio_matches = re.findall(audio_pattern, content)
             url_matches = re.findall(url_pattern, content)
@@ -563,6 +568,16 @@ if __name__ == "__main__":
     
     # 0. Initial Scan of the Inbox
     logger.info("Performing initial scan of 00_Inbox...")
+    
+    # First, handle queues specifically
+    yt_queue = inbox_path / event_handler.queue_filename
+    if yt_queue.exists():
+        event_handler.process_youtube_queue(yt_queue)
+        
+    art_queue = inbox_path / event_handler.article_queue_filename
+    if art_queue.exists():
+        event_handler.process_article_queue(art_queue)
+
     for existing_file in inbox_path.iterdir():
         if existing_file.is_file() and existing_file.suffix.lower() in event_handler.supported_extensions:
             logger.info(f"Processing existing file: {existing_file.name}")

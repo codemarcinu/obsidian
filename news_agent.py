@@ -43,7 +43,7 @@ class NewsAgent:
         self.model = ProjectConfig.OLLAMA_MODEL # Heavy (Summarization)
         self.fast_model = ProjectConfig.OLLAMA_MODEL_FAST # Light (Filtering)
         
-        self.researcher = WebResearcher()
+        self.researcher = WebResearcher(gardener=self.gardener)
         self.rag = ObsidianRAG() # For cross-checking impact
         self.gardener = ObsidianGardener()
 
