@@ -17,6 +17,7 @@ from watchdog.events import FileSystemEventHandler
 
 from config import ProjectConfig
 from video_transcriber import VideoTranscriber
+from ai_research import WebResearcher
 from ai_notes import TranscriptProcessor
 from obsidian_manager import ObsidianGardener
 from utils.life_admin import process_voice_note_for_life
@@ -51,8 +52,10 @@ class BrainGuardHandler(FileSystemEventHandler):
         self.transcriber = VideoTranscriber(model_size="medium") # Use medium for better accuracy
         self.processor = TranscriptProcessor()
         self.gardener = ObsidianGardener()
+        self.researcher = WebResearcher()
         self.supported_extensions = {'.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', '.md'}
         self.queue_filename = "youtube_queue.md"
+        self.article_queue_filename = "reading_list.md"
         self.processing_queue = False
         logger.info("BrainGuard initialized and ready to protect (Media + Notes).")
 
@@ -100,10 +103,15 @@ class BrainGuardHandler(FileSystemEventHandler):
         if file_path.name.startswith('.') or file_path.suffix == '.tmp':
             return
 
-        # Check for Queue File
+        # Check for Queue Files
         if file_path.name == self.queue_filename:
-            logger.info(f"Queue file created: {file_path}")
+            logger.info(f"YouTube Queue file created: {file_path}")
             self.process_youtube_queue(file_path)
+            return
+
+        if file_path.name == self.article_queue_filename:
+            logger.info(f"Article Queue file created: {file_path}")
+            self.process_article_queue(file_path)
             return
 
         if file_path.suffix.lower() in self.supported_extensions:
@@ -122,6 +130,65 @@ class BrainGuardHandler(FileSystemEventHandler):
         
         if file_path.name == self.queue_filename:
             self.process_youtube_queue(file_path)
+        elif file_path.name == self.article_queue_filename:
+            self.process_article_queue(file_path)
+
+    def process_article_queue(self, file_path: Path):
+        """
+        Reads the reading list file, processes new URLs, and marks them as done.
+        """
+        if self.processing_queue:
+            return
+
+        self.processing_queue = True
+        logger.info(f"Checking article queue file: {file_path}")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                # Search for http links that are NOT done/in-progress/error and NOT YouTube
+                if "http" in line_stripped and "youtube.com" not in line_stripped and "youtu.be" not in line_stripped:
+                    if "✅" not in line_stripped and "⏳" not in line_stripped and "❌" not in line_stripped:
+                        
+                        # 1. Mark as In Progress
+                        lines[i] = line.rstrip() + " ⏳ [Przetwarzanie...]\n"
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.writelines(lines)
+                        
+                        # Extract URL
+                        url_match = re.search(r'(https?://[^\s]+)', line_stripped)
+                        if not url_match:
+                            continue
+
+                        url = url_match.group(0)
+                        logger.info(f"Article Queue: Analiza {url}")
+
+                        try:
+                            # Process using WebResearcher
+                            success = self.researcher.process_url(url)
+                            
+                            if success:
+                                lines[i] = line.rstrip() + " ✅ [Gotowe]\n"
+                                logger.info(f"Article Queue: Zakończono {url}")
+                                send_windows_notification("BrainGuard Research", f"Przetworzono artykuł: {url[:30]}...")
+                            else:
+                                lines[i] = line.rstrip() + " ❌ [Błąd: Brak treści]\n"
+                        except Exception as e:
+                            logger.error(f"Błąd w kolejce artykułów dla {url}: {e}")
+                            lines[i] = line.rstrip() + f" ❌ [Błąd: {str(e)[:50]}]\n"
+                        
+                        # Write update
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.writelines(lines)
+
+        except Exception as e:
+            logger.error(f"Critical Article Queue Error: {e}")
+        finally:
+            self.processing_queue = False
 
     def process_youtube_queue(self, file_path: Path):
         """
