@@ -3,21 +3,32 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ipynb_checkpoints/
 
 # Zmienne środowiskowe i klucze
 .env
+gcp_key.json
+*.pem
+*.key
 
 # Dane aplikacji (BARDZO WAŻNE - nie wysyłamy tego)
 obsidian_db/
 Education/
 processed_news.json
 *.log
+system.log
+brain_guard.log
+brain_guard_runtime.log
 
-# Systemowe
+# Systemowe i IDE
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
+.streamlit/config.toml
 
-# Tymczasowe
+# Tymczasowe i Testowe
 temp_processing/
-tmp/temp_processing/
-gcp_key.json
+tmp/
+test_note.md
+tests/__pycache__/
