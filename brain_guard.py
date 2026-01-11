@@ -21,6 +21,16 @@ from ai_notes import TranscriptProcessor
 from obsidian_manager import ObsidianGardener
 from utils.life_admin import process_voice_note_for_life
 
+def send_windows_notification(title, message):
+    """Sends a toast notification to Windows via WSL PowerShell."""
+    try:
+        safe_title = title.replace("'", "").replace('"', '')
+        safe_msg = message.replace("'", "").replace('"', '')
+        cmd = f"powershell.exe -NoProfile -Command \"New-BurntToastNotification -Text '{safe_title}', '{safe_msg}'\""
+        os.system(cmd)
+    except Exception as e:
+        logger.warning(f"Notification failed: {e}")
+
 # Configure Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -46,16 +56,32 @@ class BrainGuardHandler(FileSystemEventHandler):
 
     def _extract_tasks(self, text: str) -> list[str]:
         """
-        Wrapper to extract tasks using Life Admin logic or fallback to simple extraction.
-        Returns a list of task strings.
+        Wrapper to extract tasks using Life Admin logic.
+        Formats for Obsidian Tasks plugin: '- [ ] Task 📅 YYYY-MM-DD 🔺high'
         """
         try:
             life_items = process_voice_note_for_life(text)
             tasks = []
             for item in life_items:
-                task_str = f"[{item.get('category', 'General')}] {item.get('action_item', 'Task')}"
+                # Basic Task
+                action = item.get('action_item', 'Task')
+                category = item.get('category', 'General')
+                
+                # Check for priority keywords
+                priority = ""
+                lower_action = action.lower()
+                if "pilne" in lower_action or "na cito" in lower_action or "ważne" in lower_action:
+                    priority = " 🔺" # High priority for Tasks plugin
+                elif "kiedyś" in lower_action:
+                    priority = " 🔽" # Low priority
+
+                # Date
+                date_str = ""
                 if item.get('due_date'):
-                    task_str += f" (📅 {item['due_date']})"
+                    date_str = f" 📅 {item['due_date']}"
+
+                # Construct: - [ ] #Category Task 📅 2026-01-01 🔺
+                task_str = f"#{category} {action}{date_str}{priority}"
                 tasks.append(task_str)
             return tasks
         except Exception as e:
@@ -327,6 +353,9 @@ class BrainGuardHandler(FileSystemEventHandler):
                 f.write(note_data['content'])
             
             logger.info(f"Saved and categorized note to: {target_path} (Category: {category})")
+
+            # [UX] Notification
+            send_windows_notification("BrainGuard", f"Gotowe: {note_data['title']}")
 
             # 5. Archive Source Audio in 00_Inbox/Archive (regardless of target category)
             inbox_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox"

@@ -64,6 +64,41 @@ class ObsidianGardener:
             self.rag = ObsidianRAG()
         return self.rag
 
+    def update_dashboard(self):
+        """Updates the 00_Dashboard.md file with latest stats."""
+        try:
+            dashboard_path = self.vault_path / "00_Dashboard.md"
+            
+            review_dir = self.vault_path / "Review"
+            inbox_count = 0
+            review_items = []
+            if review_dir.exists():
+                review_items = [f.name for f in review_dir.glob("*.md")]
+                inbox_count = len(review_items)
+            
+            content = f"""# 🧠 Drugi Mózg Dashboard
+Data aktualizacji: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## 📥 Status
+- **Review Inbox:** {inbox_count} notatek do przejrzenia.
+"""
+            if review_items:
+                content += "\n### Do zrobienia:\n"
+                for item in review_items[:5]:
+                    content += f"- [[{item[:-3]}]]\n"
+            else:
+                content += "\n✨ **Inbox Zero!** Wszystko wyczyszczone.\n"
+
+            content += "\n---\n"
+            
+            # Write/Update
+            with open(dashboard_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+                
+            self.logger.info("Dashboard updated.")
+        except Exception as e:
+            self.logger.error(f"Dashboard update failed: {e}")
+
     def update_daily_log(self, title: str, summary: str, tasks: List[str], note_path: str = None):
         """
         Appends a processing report to the Daily Note.
@@ -228,6 +263,10 @@ class ObsidianGardener:
             f.write(final_content)
             
         logger.info(f"Note saved with YAML: {full_path}", extra={"tags": "OBSIDIAN-SAVE"})
+        
+        # Update Dashboard
+        self.update_dashboard()
+        
         return full_path
 
     def smart_categorize(self, content: str) -> str:
@@ -238,9 +277,10 @@ class ObsidianGardener:
             import ollama
             from config import ProjectConfig
             
-            categories = ["Education", "Newsy", "Research", "Zasoby", "Daily", "Prywatne"]
+            categories = ["Education", "Newsy", "Research", "Zasoby", "Daily", "Prywatne", "Review"]
             prompt = f"""
             Przeanalizuj treść notatki i wybierz JEDNĄ najbardziej pasującą kategorię z listy: {', '.join(categories)}.
+            Jeśli nie masz pewności lub treść wymaga weryfikacji, wybierz 'Review'.
             Zwróć tylko nazwę kategorii, nic więcej.
             
             Treść:

@@ -175,14 +175,12 @@ class ObsidianRAG:
             messages.append({'role': 'user', 'content': question})
 
             # Force stream=True if the function is used as a generator in app.py
-            # But let's respect the flag. If stream is True, we yield chunks.
-            # If stream is False, we yield the single response dict (so loop in app.py runs once).
             response = ollama.chat(model=model, messages=messages, stream=stream)
             
             if stream:
-                yield from response
+                return response, sources
             else:
-                yield response
+                return [response], sources
 
         except Exception as e:
             self.logger.error(f"LLM Query failed: {e}")
