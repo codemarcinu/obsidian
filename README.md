@@ -1,30 +1,114 @@
-# 🧠 AI Second Brain (Obsidian Hybrid WSL Pipeline) v4.5
+# 🧠 Twój Osobisty Asystent Wiedzy (AI Second Brain)
 
-Osobisty asystent wiedzy, który automatyzuje proces zbierania, przetwarzania i wyszukiwania informacji. System integruje się z Obsidianem, tworząc "Drugi Mózg" zasilany sztuczną inteligencją, działający w architekturze hybrydowej (WSL 2 + Windows).
+**Przewodnik Użytkownika**
 
-> **Wersja 4.5 (Auto-Gardener):** Dodano funkcję "BrainGuard" – automatycznego strażnika, który monitoruje folder Inbox, przetwarza pliki w tle i inteligentnie kategoryzuje notatki do odpowiednich folderów w Skarbcu.
+## 1. Czym jest ten system?
 
-## 🚀 Główne Funkcje
+Wyobraź sobie, że masz bardzo pracowitego, niewidzialnego asystenta, który pracuje 24 godziny na dobę. Ten asystent potrafi:
 
-### 1. 🤖 BrainGuard (Automatyzacja "Drop & Forget")
-*   **Monitorowanie:** Skrypt nasłuchuje zmian w folderze `00_Inbox` na Windowsie.
-*   **Audio/Wideo:** Automatycznie wykrywa nowe pliki nagrań, wykonuje transkrypcję, generuje notatkę i archiwizuje plik źródłowy.
-*   **Notatki Tekstowe:** Przetwarza luźne notatki `.md` – dodaje tagi, linkuje pojęcia i formatuje YAML.
-*   **Inteligentna Kategoryzacja:** AI analizuje treść i automatycznie przenosi notatkę do jednego z folderów: `Education`, `Newsy`, `Research`, `Zasoby`, `Daily`, `Prywatne`.
+*   Słuchać Twoich nagrań głosowych i robić z nich notatki.
+*   Oglądać za Ciebie filmy na YouTube i streszczać je.
+*   Czytać artykuły w Internecie i wyciągać z nich to, co najważniejsze.
+*   Pamiętać wszystko, co kiedykolwiek zapisałeś, i odpowiadać na pytania na podstawie tej wiedzy.
 
-### 2. ⚡ ETL Pipeline (Interfejs UI)
-*   **Ingest:** Pobieranie i transkrypcja z YouTube URL.
-*   **Refinery:** Ręczne przetwarzanie i edycja transkryptów przed zapisaniem.
-*   **Optymalizacja VRAM:** Agresywne zwalnianie modeli z pamięci GPU po każdym zadaniu.
+System ten łączy Twoje notatki (w aplikacji Obsidian) ze Sztuczną Inteligencją, tworząc Twój "Drugi Mózg".
 
-### 3. 🔎 RAG & Chat (Baza Wiedzy)
-*   **Chat:** Możliwość rozmowy z własną bazą notatek (Retrieval Augmented Generation).
-*   **Indeksacja:** Wektorowa baza danych (ChromaDB) trzymana w szybkim systemie plików WSL.
+---
 
-### 4. 🎨 UI & UX
-*   Ciemny motyw "Obsidian Dark" w interfejsie webowym.
-*   Pasek boczny nawigacji.
-*   Automatyczne linkowanie słów kluczowych (FlashText).
+## 2. Jak to działa? (Dwa tryby pracy)
+
+System posiada dwa oblicza. Możesz korzystać z jednego lub obu, w zależności od potrzeb.
+
+### A. "Niewidzialny Strażnik" (BrainGuard) 🤖
+
+To tryb automatyczny ("Wrzuć i Zapomnij"). Działa w tle i obserwuje jeden konkretny folder w Twoim komputerze: **`00_Inbox`**.
+
+**Jak z tego korzystać?**
+
+1.  **Nagrania głosowe:** Wrzucasz plik audio (np. z dyktafonu w telefonie) do folderu `00_Inbox`.
+    *   *Co robi system:* Zamienia mowę na tekst, tworzy ładną notatkę, wyciąga listę zadań (np. "Kupić mleko", "Wysłać przelew") i segreguje notatkę do odpowiedniego folderu.
+
+2.  **Kolejka YouTube:** W folderze `00_Inbox` masz plik `youtube_queue.md`. Wklejasz tam linki do filmów, które chcesz przetworzyć.
+    *   *Co robi system:* W nocy (lub w tle) pobiera treść filmów i tworzy z nich materiały edukacyjne.
+
+3.  **Kolejka Artykułów:** W pliku `reading_list.md` wklejasz linki do ciekawych artykułów.
+    *   *Co robi system:* Czyta je za Ciebie i tworzy streszczenia "tl;dr" (za długie; nie czytałem).
+
+### B. "Centrum Dowodzenia" (Aplikacja w przeglądarce) 🖥️
+
+To panel sterowania, który otwierasz w przeglądarce internetowej, gdy chcesz ręcznie zarządzać systemem lub z nim "porozmawiać".
+
+**Do czego służy?**
+
+*   **Czat z Wiedzą (RAG):** Możesz zapytać: *"Co mówiłem w zeszłym miesiącu o projekcie X?"* lub *"Jakie mam notatki na temat bezpieczeństwa?"*. System przeszuka Twoje pliki i udzieli odpowiedzi.
+*   **Ręczne Pobieranie:** Jeśli chcesz "na już" przetworzyć film z YouTube i widzieć postęp na pasku ładowania.
+*   **Przegląd Newsów:** Klikasz jeden przycisk, a system pobiera najnowsze wiadomości z cyberbezpieczeństwa i tworzy dla Ciebie "poranną gazetę".
+
+---
+
+## 3. Co system robi za Ciebie? (Główne Funkcje)
+
+### 🎙️ Notatki ze Spotkań i Audio (Transkrypcja)
+
+Nie musisz już ręcznie notować podczas spotkań czy spacerów. Nagraj się, wrzuć plik do systemu.
+
+*   **Rezultat:** Otrzymasz dokument z podziałem na tematy, podsumowaniem i listą zadań.
+*   **Inteligentne Zadania:** Jeśli powiesz "Muszę zapłacić fakturę do piątku", system wykryje to jako zadanie z datą i priorytetem.
+
+### 🎬 Oglądanie YouTube (Edukacja)
+
+Chcesz wiedzy z godzinnego wykładu, ale masz tylko 5 minut?
+
+*   **Działanie:** Wklejasz link. System "ogląda" wideo.
+*   **Rezultat:** Notatka w stylu akademickim lub wpis na bloga, zawierająca kluczowe punkty wiedzy bez "lania wody".
+
+### 📰 Twój Osobisty Prasówka (News Agent)
+
+Zamiast przeglądać 10 stron internetowych codziennie rano:
+
+*   **Działanie:** System skanuje zaufane źródła (np. Sekurak, Niebezpiecznik).
+*   **Filtr:** Odrzuca reklamy i mało istotne treści.
+*   **Rezultat:** Tworzy jeden raport dzienny ("Daily Digest") z najważniejszymi informacjami. Może nawet wygenerować plik MP3, żebyś mógł posłuchać newsów w drodze do pracy!
+
+### 🔍 Inteligentne Badania (Web Research)
+
+Widzisz długi, skomplikowany artykuł techniczny?
+
+*   **Działanie:** Dajesz systemowi link.
+*   **Rezultat:** Otrzymasz analizę zawierającą fakty, konfiguracje i konkrety, z pominięciem marketingowego wstępu.
+
+### 🧹 Porządkowanie (Ogrodnik / Gardener)
+
+Nie martw się, gdzie zapisać notatkę.
+
+*   **Działanie:** System sam analizuje treść. Jeśli to faktura – trafi do "Finanse". Jeśli to artykuł o Pythonie – trafi do "Edukacja".
+*   **Linkowanie:** System sam połączy nową notatkę z innymi, które już masz, tworząc sieć powiązań.
+
+---
+
+## 4. Twój Dzień z Systemem (Przykładowy Scenariusz)
+
+1.  **Poranek:** Otwierasz Obsidiana. Wita Cię **Dashboard**, gdzie widzisz podsumowanie nowych notatek przetworzonych w nocy (np. 3 filmy z YouTube i raport newsowy).
+2.  **W pracy:** Znajdujesz ciekawy artykuł, ale nie masz czasu czytać. Wklejasz link do pliku `reading_list.md` w folderze Inbox.
+3.  **W drodze do domu:** Nagrywasz notatkę głosową: *"Pamiętaj o przeglądzie samochodu w przyszłym tygodniu i kup mleko"*. Plik automatycznie synchronizuje się do folderu `00_Inbox`.
+4.  **Wieczorem:** System automatycznie przetwarza Twoje nagranie. "Przegląd samochodu" trafia na listę zadań z datą, a artykuł z pracy czeka jako streszczenie w folderze "Research".
+
+---
+
+## 5. Rozwiązywanie problemów (W skrócie)
+
+*   **"System nie widzi pliku!"** – Upewnij się, że wrzuciłeś go do folderu `00_Inbox`. Daj mu chwilę (system czeka 1-2 sekundy, aż plik się skopiuje).
+*   **"Gdzie jest moja notatka?"** – System mógł ją automatycznie przenieść. Sprawdź Dashboard lub folder `Zasoby`, jeśli system nie był pewien kategorii.
+*   **"Kolejka YouTube nie działa"** – Sprawdź w pliku `youtube_queue.md`, czy przy linku pojawił się symbol ⏳ (w trakcie) lub ✅ (gotowe). Jeśli jest ❌, coś poszło nie tak z linkiem.
+
+---
+
+*Dokumentacja oparta na wersji systemu v4.5 (BrainGuard + UI + RAG).*
+
+---
+---
+
+# 🔧 Sekcja Techniczna (Administrator)
 
 ## 🛠️ Architektura Hybrydowa (WSL + Windows)
 
@@ -66,7 +150,3 @@ System wykorzystuje lokalną instancję Ollama:
 *   **Bielik-11b-v2.3:** Główny "mózg" do generowania treści i analizy (wysoka jakość, język polski).
 *   **Llama 3.2:** Szybki model do tagowania i kategoryzacji (niskie opóźnienie).
 *   **Mxbai-embed-large:** Model embeddingów do wyszukiwania semantycznego.
-
-## 📝 Licencja
-
-Projekt prywatny.
