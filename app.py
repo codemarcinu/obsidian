@@ -123,7 +123,8 @@ with st.sidebar:
             "📰 Research & News",
             "⚙️ System"
         ],
-        label_visibility="collapsed"
+        label_visibility="collapsed",
+        key="main_nav"
     )
     
     st.divider()

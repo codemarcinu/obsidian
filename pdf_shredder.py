@@ -159,6 +159,31 @@ class PDFShredder:
         except Exception:
             return {}
 
+    def summarize_visual_content(self, text: str, labels: List[str]) -> str:
+        """Generates a concise summary of the visual note using the main LLM."""
+        prompt = f"""
+        Jesteś asystentem AI analizującym notatki wizualne (skany, zdjęcia).
+        
+        Kontekst wizualny (etykiety): {', '.join(labels)}
+        Tekst z obrazu (OCR):
+        {text[:4000]}
+        
+        Zadanie:
+        Napisz krótkie, konkretne podsumowanie tego, co znajduje się na obrazie.
+        Jeśli to dokument, opisz jego cel i główne ustalenia.
+        Jeśli to notatka odręczna, przepisz główne punkty.
+        Jeśli to zdjęcie przedmiotu/miejsca, opisz co to jest na podstawie etykiet i tekstu.
+        """
+        try:
+            response = ollama.chat(
+                model=ProjectConfig.OLLAMA_MODEL, # Use the smarter model
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            return response['message']['content']
+        except Exception as e:
+            self.logger.error(f"Visual summarization failed: {e}")
+            return "Nie udało się wygenerować podsumowania."
+
     def process_pdf(self, pdf_path: str) -> Tuple[bool, str]:
         """Main pipeline for PDF ingestion."""
         self.logger.info(f"Shredding PDF: {pdf_path}")
@@ -233,6 +258,9 @@ class PDFShredder:
             if "FINANSE" in tags or "ZDROWIE" in tags:
                 home_data = self.extract_home_data(text_content)
 
+            # 2.5 Generate AI Summary
+            ai_summary = self.summarize_visual_content(text_content, labels)
+
             # 3. Copy image to Vault Assets
             assets_dir = self.vault_path / "Assets"
             assets_dir.mkdir(exist_ok=True)
@@ -251,7 +279,9 @@ class PDFShredder:
                 
                 # Append Image Analysis info
                 f.seek(0, 2) # End of file
-                f.write(f"\n\n## Visual Analysis\n**Detected Objects:** {', '.join(labels)}\n")
+                # Insert Summary before Visual Analysis details
+                f.write(f"\n\n## 🧠 Analiza AI\n{ai_summary}\n")
+                f.write(f"\n## Visual Analysis\n**Detected Objects:** {', '.join(labels)}\n")
 
             # 5. Auto-linking via Gardener
             gardener = ObsidianGardener(str(self.vault_path))
