@@ -65,37 +65,51 @@ class ObsidianGardener:
         return self.rag
 
     def update_dashboard(self):
-        """Updates the 00_Dashboard.md file with latest stats."""
+        """
+        Ensures 00_Dashboard.md exists and contains the Dataview query.
+        Does NOT overwrite if it already looks like a Dataview dashboard,
+        unless it detects the old static format.
+        """
         try:
             dashboard_path = self.vault_path / "00_Dashboard.md"
             
-            review_dir = self.vault_path / "Review"
-            inbox_count = 0
-            review_items = []
-            if review_dir.exists():
-                review_items = [f.name for f in review_dir.glob("*.md")]
-                inbox_count = len(review_items)
-            
-            content = f"""# 🧠 Drugi Mózg Dashboard
-Data aktualizacji: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+            # Dynamic Dataview Template
+            dataview_content = """# 🧠 Drugi Mózg Dashboard
+> Dashboard dynamiczny (wymaga wtyczki Dataview)
 
-## 📥 Status
-- **Review Inbox:** {inbox_count} notatek do przejrzenia.
+## 📥 Status Inbox
+```dataview
+TABLE created as "Utworzono", tags as "Tagi"
+FROM "00_Inbox" OR #to-review
+SORT created DESC
+LIMIT 20
+```
+
+## 📅 Ostatnio modyfikowane
+```dataview
+TABLE file.mtime as "Modyfikacja"
+FROM ""
+SORT file.mtime DESC
+LIMIT 10
+```
 """
-            if review_items:
-                content += "\n### Do zrobienia:\n"
-                for item in review_items[:5]:
-                    content += f"- [[{item[:-3]}]]\n"
-            else:
-                content += "\n✨ **Inbox Zero!** Wszystko wyczyszczone.\n"
-
-            content += "\n---\n"
             
-            # Write/Update
-            with open(dashboard_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-                
-            self.logger.info("Dashboard updated.")
+            should_write = False
+            
+            if not dashboard_path.exists():
+                should_write = True
+            else:
+                # Check if we need to migrate from old static format
+                current_content = dashboard_path.read_text(encoding='utf-8')
+                if "dataview" not in current_content and "Review Inbox:" in current_content:
+                    should_write = True
+                    self.logger.info("Detected old static dashboard. Migrating to Dataview.")
+            
+            if should_write:
+                with open(dashboard_path, 'w', encoding='utf-8') as f:
+                    f.write(dataview_content)
+                self.logger.info("Initialized 00_Dashboard.md with Dataview template.", extra={"tags": "GARDENER-DASHBOARD"})
+            
         except Exception as e:
             self.logger.error(f"Dashboard update failed: {e}")
 
