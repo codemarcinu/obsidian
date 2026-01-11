@@ -4,6 +4,7 @@ import shutil
 import logging
 import sys
 import os
+import re
 
 # Ensure project root is in sys.path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,7 @@ from config import ProjectConfig
 from video_transcriber import VideoTranscriber
 from ai_notes import TranscriptProcessor
 from obsidian_manager import ObsidianGardener
+from utils.life_admin import process_voice_note_for_life
 
 # Configure Logging
 logging.basicConfig(
@@ -44,32 +46,17 @@ class BrainGuardHandler(FileSystemEventHandler):
 
     def _extract_tasks(self, text: str) -> list[str]:
         """
-        Uses the fast LLM to extract actionable tasks from the transcript.
+        Wrapper to extract tasks using Life Admin logic or fallback to simple extraction.
+        Returns a list of task strings.
         """
         try:
-            prompt = """
-            Jesteś asystentem. Przeanalizuj poniższy tekst i wyciągnij listę konkretnych zadań (ToDo) dla użytkownika.
-            Zwróć TYLKO listę zadań, każde w nowej linii, zaczynając od myślnika "- ".
-            Jeśli nie ma zadań, zwróć "BRAK".
-            
-            Tekst:
-            """
-            response = ollama.chat(
-                model=ProjectConfig.OLLAMA_MODEL_FAST,
-                messages=[{'role': 'user', 'content': f"{prompt}\n{text[:4000]}"}] # Limit context
-            )
-            content = response['message']['content'].strip()
-            
-            if "BRAK" in content:
-                return []
-            
+            life_items = process_voice_note_for_life(text)
             tasks = []
-            for line in content.split('\n'):
-                line = line.strip()
-                if line.startswith('- '):
-                    tasks.append(line[2:])
-                elif line.startswith('* '):
-                    tasks.append(line[2:])
+            for item in life_items:
+                task_str = f"[{item.get('category', 'General')}] {item.get('action_item', 'Task')}"
+                if item.get('due_date'):
+                    task_str += f" (📅 {item['due_date']})"
+                tasks.append(task_str)
             return tasks
         except Exception as e:
             logger.error(f"Task extraction failed: {e}")
@@ -96,23 +83,27 @@ class BrainGuardHandler(FileSystemEventHandler):
                 self.process_file(file_path)
 
     def process_markdown_file(self, file_path: Path):
-        """Processes a markdown file looking for audio attachments."""
+        """Processes a markdown file looking for audio attachments OR URLs."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            import re
             # Pattern for ![[Recording 2026... .m4a]]
             audio_pattern = r'!\[\[(.*?\.(mp3|wav|m4a|ogg|mp4))\]\]'
-            matches = re.findall(audio_pattern, content)
+            # Pattern for YouTube URLs
+            url_pattern = r'(https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+))'
+            
+            audio_matches = re.findall(audio_pattern, content)
+            url_matches = re.findall(url_pattern, content)
 
-            if not matches:
-                logger.info(f"No audio attachments in {file_path.name}. Processing as text note.")
+            if not audio_matches and not url_matches:
+                logger.info(f"No audio/video attachments in {file_path.name}. Processing as text note.")
                 # Treat as text note to be refined
                 self._refine_text_note(file_path, content)
                 return
 
-            for match in matches:
+            # Process Audio Files
+            for match in audio_matches:
                 audio_filename = match[0]
                 
                 # Check if already transcribed
@@ -137,10 +128,17 @@ class BrainGuardHandler(FileSystemEventHandler):
                     # 2. Generate Note Snippet
                     note_data = self.processor.generate_note_content_from_text(raw_text, meta={"title": audio_filename})
                     
-                    # 3. Update the original Markdown file
+                    # 3. Life Admin Extraction
+                    tasks = self._extract_tasks(raw_text)
+                    life_section = ""
+                    if tasks:
+                        life_section = "\n### 🏠 Life Admin & Tasks\n" + "\n".join([f"- [ ] {t}" for t in tasks]) + "\n"
+
+                    # 4. Update the original Markdown file
                     update_content = f"\n\n---\n## 🎤 Transkrypcja Nagrania: {audio_filename}\n\n"
                     update_content += f"### 📝 Podsumowanie\n{note_data['summary']}\n\n"
                     update_content += f"### 📜 Tekst\n{raw_text}\n"
+                    update_content += life_section
                     
                     with open(file_path, 'a', encoding='utf-8') as f:
                         f.write(update_content)
@@ -148,6 +146,7 @@ class BrainGuardHandler(FileSystemEventHandler):
                     logger.info(f"Updated note {file_path.name} with transcription.")
 
                     # 3.5 Smart Move based on new content
+                    # Reload content
                     with open(file_path, 'r', encoding='utf-8') as f:
                         full_content = f.read()
                     
@@ -159,12 +158,13 @@ class BrainGuardHandler(FileSystemEventHandler):
                         new_note_path = target_dir / file_path.name
                         shutil.move(file_path, new_note_path)
                         logger.info(f"Categorized and moved MD file to: {new_note_path}")
+                        # Update file_path for subsequent loops if needed (though we only process once per event generally)
+                        file_path = new_note_path
 
                     # 4. Move audio to archive
                     archive_dir = ProjectConfig.OBSIDIAN_VAULT / "00_Inbox" / "Archive"
                     archive_dir.mkdir(parents=True, exist_ok=True)
                     
-                    # Move carefully in case it's in use
                     try:
                         shutil.move(audio_path, archive_dir / audio_filename)
                         logger.info(f"Archived audio file to: {archive_dir / audio_filename}")
@@ -172,6 +172,43 @@ class BrainGuardHandler(FileSystemEventHandler):
                         logger.warning(f"Could not move audio file (may be in use): {e}")
                 else:
                     logger.warning(f"Could not find audio file: {audio_filename}")
+
+            # Process YouTube URLs
+            for match in url_matches:
+                full_url = match[0]
+                video_id = match[1]
+                
+                if f"Transkrypcja Wideo" in content and video_id in content:
+                     # Simple avoidance check
+                     continue
+
+                logger.info(f"Found YouTube URL: {full_url}")
+                
+                try:
+                    # 1. Transcribe (Download -> Inbox JSON)
+                    json_path = self.transcriber.process_to_inbox(full_url)
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        payload = json.load(f)
+                    
+                    raw_text = payload['content']
+                    meta = payload['meta']
+                    
+                    # 2. Generate Note Snippet
+                    note_data = self.processor.generate_note_content_from_text(raw_text, meta=meta)
+                    
+                    # 3. Update Note
+                    update_content = f"\n\n---\n## 🎬 Transkrypcja Wideo: {meta['title']}\n"
+                    update_content += f"URL: {full_url}\n\n"
+                    update_content += f"### 📝 Podsumowanie\n{note_data['summary']}\n\n"
+                    update_content += f"### 📜 Tekst\n{raw_text}\n"
+                    
+                    with open(file_path, 'a', encoding='utf-8') as f:
+                        f.write(update_content)
+                        
+                    logger.info(f"Updated note {file_path.name} with video transcript.")
+                except Exception as e:
+                    logger.error(f"Failed to process video URL {full_url}: {e}")
+
 
         except Exception as e:
             logger.error(f"Failed to process MD file {file_path}: {e}")
@@ -184,11 +221,6 @@ class BrainGuardHandler(FileSystemEventHandler):
             linked_content = self.gardener.suggest_semantic_links(linked_content)
             
             # 2. Generate Tags (LLM)
-            # We use the fast processor just to get tags, or re-use TranscriptProcessor logic?
-            # Let's use TranscriptProcessor to 'generate_note_content' but treating input as the text.
-            # But that might overwrite structure. We just want tags.
-            
-            # Let's ask LLM for tags for this content.
             prompt = f"Proszę wygenerować 3-5 tagów (słowa kluczowe) dla poniższego tekstu. Zwróć tylko listę po przecinku.\n\n{content[:2000]}"
             response = ollama.chat(
                 model=ProjectConfig.OLLAMA_MODEL_FAST,
@@ -198,16 +230,9 @@ class BrainGuardHandler(FileSystemEventHandler):
             tags = [t.strip() for t in tags_str.split(',') if t.strip()]
             
             # 3. Save with YAML (This adds title, date, tags)
-            # We need to overwrite the file or save to a new location?
-            # Save uses `save_note` which writes to Vault Root. We want to categorize.
-            
-            # Let's construct the final content manually to preserve original text structure but add YAML.
-            # Check if YAML already exists?
             if content.startswith('---'):
-                # Already has YAML, just append links if changed
                 final_content = linked_content
             else:
-                # Add YAML
                 import datetime
                 frontmatter = "---\n"
                 frontmatter += f"title: {file_path.stem}\n"
@@ -282,8 +307,13 @@ class BrainGuardHandler(FileSystemEventHandler):
             # 2. Generate Note Content (Summary & Body)
             note_data = self.processor.generate_note_content_from_text(raw_text, meta=meta)
             
-            # 3. Extract Tasks
+            # 3. Extract Tasks (Life Admin)
             tasks = self._extract_tasks(raw_text)
+
+            # Append Life Admin section to content
+            if tasks:
+                life_section = "\n\n## 🏠 Life Admin & Tasks\n" + "\n".join([f"- [ ] {t}" for t in tasks])
+                note_data['content'] += life_section
 
             # 4. Save to Obsidian (With Smart Categorization)
             category = self.gardener.smart_categorize(note_data['content'])

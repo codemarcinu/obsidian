@@ -1,7 +1,10 @@
 import os
 import logging
 import pdfplumber
-from typing import List, Dict, Optional, Tuple
+import ollama
+import json
+import shutil
+from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
 from datetime import datetime
 
@@ -17,7 +20,9 @@ class PDFShredder:
     COMPLIANCE_MAP = {
         "DORA": ["DORA", "ICT", "rezyliencja", "operacyjna", "incydent", "finansowe"],
         "NIS2": ["NIS2", "dyrektywa", "cyberbezpieczeństwo", "bezpieczeństwo sieci", "podmiot kluczowy"],
-        "RODO": ["RODO", "GDPR", "dane osobowe", "przetwarzanie", "osób fizycznych", "poufność"]
+        "RODO": ["RODO", "GDPR", "dane osobowe", "przetwarzanie", "osób fizycznych", "poufność"],
+        "FINANSE": ["faktura", "rachunek", "płatność", "kwota", "brutto", "netto", "vat", "przelew", "termin płatności"],
+        "ZDROWIE": ["badanie", "wynik", "pacjent", "lekarz", "skierowanie", "recepta", "laboratorium"]
     }
 
     def __init__(self, vault_path: Optional[str] = None):
@@ -60,6 +65,51 @@ class PDFShredder:
         tags = self.detect_compliance_tags(combined_text)
         return combined_text, tags
 
+    def suggest_filename(self, text: str) -> str:
+        """Uses LLM to suggest a standardized filename."""
+        prompt = """
+        Na podstawie treści dokumentu zaproponuj nazwę pliku w formacie: YYYY-MM-DD_Typ_Podmiot_Opis.
+        Typ: Faktura, Umowa, Wynik, Pismo, Inne.
+        Podmiot: Nazwa firmy/osoby (np. Orange, UPC, LuxMed).
+        Opis: Krótko (np. Internet, Krew, Prad).
+        
+        Jeśli nie znajdziesz daty w dokumencie, użyj dzisiejszej.
+        Zwróć TYLKO nazwę pliku, bez rozszerzenia.
+        """
+        try:
+            response = ollama.chat(
+                model=ProjectConfig.OLLAMA_MODEL_FAST,
+                messages=[{'role': 'user', 'content': f"{prompt}\n\nTekst: {text[:2000]}"}]
+            )
+            filename = response['message']['content'].strip()
+            # Sanitize
+            filename = "".join(c for c in filename if c.isalnum() or c in ('-', '_')).strip()
+            return filename
+        except Exception as e:
+            self.logger.error(f"Filename suggestion failed: {e}")
+            return f"Doc_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def extract_home_data(self, text: str) -> Dict[str, Any]:
+        """Extracts structured data for Life Admin (invoices, etc.)."""
+        prompt = """
+        Przeanalizuj ten dokument. Jeśli to faktura lub dokument płatniczy, wyciągnij:
+        - date (termin płatności YYYY-MM-DD)
+        - amount (kwota z walutą)
+        - account (numer konta)
+        - subject (czego dotyczy)
+        
+        Zwróć JSON. Jeśli nie znaleziono, zwróć pusty JSON {}.
+        """
+        try:
+            response = ollama.chat(
+                model=ProjectConfig.OLLAMA_MODEL_FAST,
+                messages=[{'role': 'user', 'content': f"{prompt}\n\nTekst: {text[:3000]}"}],
+                format='json'
+            )
+            return json.loads(response['message']['content'])
+        except Exception:
+            return {}
+
     def process_pdf(self, pdf_path: str) -> Tuple[bool, str]:
         """Main pipeline for PDF ingestion."""
         self.logger.info(f"Shredding PDF: {pdf_path}")
@@ -68,25 +118,55 @@ class PDFShredder:
         if not content:
             return False, "Failed to extract content."
 
-        # Metadata generation
-        title = Path(pdf_path).stem
-        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+        # 1. Smart Renaming
+        new_filename = self.suggest_filename(content)
+        original_path = Path(pdf_path)
         
-        # Save structured note
-        final_path = self.save_as_note(safe_title, content, tags)
+        # Rename the source file if possible (and if it's in Inbox/Temp)
+        # Assuming we are working on a copy or it's safe to rename in place if it's in a watched dir.
+        # But pdf_path might be in temp. Let's define safe_title for the Note based on this.
+        safe_title = new_filename
         
-        # Auto-linking via Gardener
+        # 2. Extract Home Data if applicable
+        home_data = {}
+        if "FINANSE" in tags or "ZDROWIE" in tags:
+            home_data = self.extract_home_data(content)
+
+        # 3. Save structured note
+        final_path = self.save_as_note(safe_title, content, tags, home_data)
+        
+        # 4. Auto-linking via Gardener
         gardener = ObsidianGardener(str(self.vault_path))
         gardener.process_file(final_path)
         
         return True, str(final_path)
 
-    def save_as_note(self, title: str, content: str, tags: List[str]) -> Path:
+    def save_as_note(self, title: str, content: str, tags: List[str], home_data: Dict[str, Any] = None) -> Path:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        filepath = self.output_dir / f"PDF-{title}.md"
+        
+        # Determine subdir based on tags
+        subdir = "Compliance"
+        if "FINANSE" in tags: subdir = "Finanse"
+        elif "ZDROWIE" in tags: subdir = "Zdrowie"
+        
+        output_dir = self.vault_path / subdir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        filepath = output_dir / f"{title}.md"
         
         tag_string = "\n  - ".join(tags)
         
+        # Construct Callout for Home Data
+        callout = ""
+        if home_data:
+            callout = f"""
+> [!money] Podsumowanie Dokumentu
+> **Kwota:** {home_data.get('amount', 'N/A')}
+> **Termin:** {home_data.get('date', 'N/A')} 📅 {home_data.get('date', 'N/A')}
+> **Konto:** {home_data.get('account', 'N/A')}
+> **Dotyczy:** {home_data.get('subject', 'N/A')}
+"""
+
         note_content = f"""
 ---
 created: {timestamp}
@@ -98,6 +178,7 @@ status: processed
 ---
 
 # {title}
+{callout}
 
 > [!INFO] Dokument przeanalizowany przez PDF Shredder (Refactored v2.0)
 > Wykryte obszary zgodności: {', '.join(tags)}
