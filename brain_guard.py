@@ -52,6 +52,8 @@ class BrainGuardHandler(FileSystemEventHandler):
         self.processor = TranscriptProcessor()
         self.gardener = ObsidianGardener()
         self.supported_extensions = {'.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', '.md'}
+        self.queue_filename = "youtube_queue.md"
+        self.processing_queue = False
         logger.info("BrainGuard initialized and ready to protect (Media + Notes).")
 
     def _extract_tasks(self, text: str) -> list[str]:
@@ -98,6 +100,12 @@ class BrainGuardHandler(FileSystemEventHandler):
         if file_path.name.startswith('.') or file_path.suffix == '.tmp':
             return
 
+        # Check for Queue File
+        if file_path.name == self.queue_filename:
+            logger.info(f"Queue file created: {file_path}")
+            self.process_youtube_queue(file_path)
+            return
+
         if file_path.suffix.lower() in self.supported_extensions:
             logger.info(f"detected new file: {file_path}")
             # Wait for file to be fully written (important for MD files)
@@ -107,6 +115,104 @@ class BrainGuardHandler(FileSystemEventHandler):
                 self.process_markdown_file(file_path)
             else:
                 self.process_file(file_path)
+
+    def on_modified(self, event):
+        if event.is_directory: return
+        file_path = Path(event.src_path)
+        
+        if file_path.name == self.queue_filename:
+            self.process_youtube_queue(file_path)
+
+    def process_youtube_queue(self, file_path: Path):
+        """
+        Reads the queue file, processes new links, and marks them as done.
+        """
+        if self.processing_queue:
+            return
+
+        self.processing_queue = True
+        logger.info(f"Checking queue file: {file_path}")
+        
+        try:
+            # Read all lines
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Identify work
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                # Check for YouTube links that are NOT done/in-progress/error
+                if ("youtube.com" in line_stripped or "youtu.be" in line_stripped) and \
+                   "✅" not in line_stripped and \
+                   "⏳" not in line_stripped and \
+                   "❌" not in line_stripped:
+                         
+                    # 1. Mark as In Progress immediately
+                    lines[i] = line.rstrip() + " ⏳ [W trakcie...]\n"
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.writelines(lines)
+                    
+                    # Extract URL
+                    url_match = re.search(r'(https?://(?:www\.|m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+))', line_stripped)
+                    if not url_match:
+                        lines[i] = line.rstrip() + " ❌ [Błąd: Niepoprawny URL]\n"
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.writelines(lines)
+                        continue
+
+                    full_url = url_match.group(0)
+                    logger.info(f"Queue processing: {full_url}")
+
+                    try:
+                        # PROCESS
+                        # 1. Transcribe (Download -> Inbox JSON)
+                        json_path = self.transcriber.process_to_inbox(full_url)
+                        
+                        # 2. Read JSON payload
+                        with open(json_path, 'r', encoding='utf-8') as jf:
+                            payload = json.load(jf)
+                        
+                        # 3. Generate Note Content
+                        note_data = self.processor.generate_note_content_from_text(
+                            payload['content'], 
+                            meta=payload['meta']
+                        )
+                        
+                        # 4. Save to Vault (Smart Categorize)
+                        category = self.gardener.smart_categorize(note_data['content'])
+                        target_dir = ProjectConfig.OBSIDIAN_VAULT / category
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        target_path = target_dir / f"{note_data['title']}.md"
+                        
+                        with open(target_path, 'w', encoding='utf-8') as nf:
+                            nf.write(note_data['content'])
+                            
+                        # 5. Update Daily Log
+                        self.gardener.update_daily_log(
+                            title=note_data['title'],
+                            summary=note_data['summary'],
+                            tasks=[],
+                            note_path=str(target_path)
+                        )
+
+                        # Mark Done
+                        lines[i] = line.rstrip() + " ✅ [Gotowe]\n"
+                        logger.info(f"Queue Task Completed: {full_url}")
+                        send_windows_notification("BrainGuard Queue", f"Przetworzono: {note_data['title']}")
+
+                    except Exception as e:
+                        logger.error(f"Queue Task Failed {full_url}: {e}")
+                        lines[i] = line.rstrip() + f" ❌ [Błąd: {str(e)[:50]}]\n"
+                    
+                    # Write update after processing this item
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.writelines(lines)
+
+        except Exception as e:
+            logger.error(f"Error processing queue file: {e}")
+        finally:
+            self.processing_queue = False
 
     def process_markdown_file(self, file_path: Path):
         """Processes a markdown file looking for audio attachments OR URLs."""
