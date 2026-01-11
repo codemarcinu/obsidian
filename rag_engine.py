@@ -6,6 +6,7 @@ from pathlib import Path
 
 import chromadb
 import ollama
+from sentence_transformers import CrossEncoder
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from tqdm import tqdm
 
@@ -37,6 +38,13 @@ class ObsidianRAG:
             separators=["\n## ", "\n### ", "\n#### ", "\n", " ", ""],
             keep_separator=True
         )
+        
+        # Reranking Model (Lightweight Cross-Encoder)
+        try:
+            self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        except Exception as e:
+            self.logger.warning(f"Failed to load CrossEncoder: {e}")
+            self.cross_encoder = None
 
     def _get_file_hash(self, file_path: Path) -> str:
         """Generates MD5 hash for content validation."""
@@ -152,20 +160,43 @@ class ObsidianRAG:
             return []
 
     def query(self, question: str, history: List[Dict] = None, n_results=5, model_name=None, stream=False):
-        """Retrieves context and generates response."""
+        """Retrieves context and generates response with Reranking."""
         model = model_name or ProjectConfig.OLLAMA_MODEL
         try:
+            # 1. Retrieval (High Recall)
+            initial_k = 20
             q_embed = ollama.embeddings(model=self.embedding_model, prompt=question)["embedding"]
-            results = self.collection.query(query_embeddings=[q_embed], n_results=n_results)
+            results = self.collection.query(query_embeddings=[q_embed], n_results=initial_k)
             
             if not results['documents'] or not results['documents'][0]:
                 context = "Brak odpowiednich notatek w bazie wiedzy."
-                sources = []
+                sources = set()
             else:
                 docs = results['documents'][0]
                 metas = results['metadatas'][0]
-                context = "\n".join([f"--- DOKUMENT: {m['filename']} ---\n{d}" for d, m in zip(docs, metas)])
-                sources = {m['filename'] for m in metas}
+                
+                # 2. Reranking (High Precision)
+                if self.cross_encoder:
+                    pairs = [[question, doc] for doc in docs]
+                    scores = self.cross_encoder.predict(pairs)
+                    
+                    # Sort by score descending
+                    ranked = sorted(zip(docs, metas, scores), key=lambda x: x[2], reverse=True)
+                    
+                    # Take top n_results
+                    top_k = ranked[:n_results]
+                    
+                    # Format context with scores
+                    context = "\n".join([f"--- DOKUMENT: {m['filename']} (Relevance: {s:.2f}) ---\n{d}" for d, m, s in top_k])
+                    sources = {m['filename'] for d, m, s in top_k}
+                else:
+                    # Fallback (Just take top n_results from Vector DB)
+                    # Vector DB results are already sorted by distance (but check if chroma returns sorted?)
+                    # Chroma usually returns sorted by distance.
+                    top_k_docs = docs[:n_results]
+                    top_k_metas = metas[:n_results]
+                    context = "\n".join([f"--- DOKUMENT: {m['filename']} ---\n{d}" for d, m in zip(top_k_docs, top_k_metas)])
+                    sources = {m['filename'] for m in top_k_metas}
 
             system_msg = f"KONTEKST:\n{context}\n\nOdpowiedz na pytanie na podstawie kontekstu."
             
